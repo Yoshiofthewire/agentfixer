@@ -22,6 +22,13 @@ for f in "$d/$key.$n" "$d/$key"; do
   if [ -f "$f" ]; then cat "$f"; break; fi
 done
 
+# Stderr is independent too: real gh reports "no required checks reported on
+# the 'x' branch" there, with exit 1 and empty stdout, and agentfixer has to
+# tell that apart from a transport failure.
+for f in "$d/$key.$n.err" "$d/$key.err"; do
+  if [ -f "$f" ]; then cat "$f" >&2; break; fi
+done
+
 rc=0
 for f in "$d/$key.$n.exit" "$d/$key.exit"; do
   if [ -f "$f" ]; then rc="$(cat "$f")"; break; fi

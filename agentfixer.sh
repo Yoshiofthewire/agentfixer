@@ -752,10 +752,30 @@ SCHEMA
 
 # An empty required-check set is "none", never "pass". Green with nothing to
 # be green about is not evidence.
+#
+# gh reports zero required checks as a FAILURE: rc=1, empty stdout, and
+# "no required checks reported on the 'X' branch" on stderr (measured against
+# gh 2.98.0; a pending or failing check set is rc=0 with JSON, the documented
+# exit 8 applying to the human-readable output rather than --json). So a
+# non-zero gh here means either "none" or "gh itself broke", and the two are
+# only distinguishable by that message. Both fail closed; only the wording
+# differs, and telling a user to fix their branch protection when the real
+# cause was an HTTP 503 sends them somewhere useless.
 af_check_state() {
-  local json
+  local json errfile msg rc=0
   af_require_slug
-  json="$(gh pr checks "$1" --required --repo "$AF_SLUG" --json bucket,name 2>/dev/null || echo '[]')"
+  errfile="$(mktemp)"
+  json="$(gh pr checks "$1" --required --repo "$AF_SLUG" --json bucket,name \
+    2>"$errfile")" || rc=$?
+  msg="$(tr '\n' ' ' < "$errfile")"
+  rm -f "$errfile"
+  if [ "$rc" -ne 0 ]; then
+    case "$msg" in
+      *"no required checks reported"*|*"no checks reported"*) printf 'none\n' ;;
+      *) printf 'error: gh pr checks exited %s: %s\n' "$rc" "$msg" ;;
+    esac
+    return 0
+  fi
   printf '%s' "$json" | jq -r '
     if length == 0 then "none"
     elif any(.[]; .bucket == "fail" or .bucket == "cancel") then "fail"
@@ -842,6 +862,11 @@ af_ci_loop() {
         gh pr edit "$pr" --repo "$AF_SLUG" --add-label needs-human >/dev/null 2>&1 || true
         af_die "G3: PR #$pr has no required checks. Enable required status
 checks in branch protection. PR left open." "$AF_EX_GATE" ;;
+      error*)
+        gh pr edit "$pr" --repo "$AF_SLUG" --add-label needs-human >/dev/null 2>&1 || true
+        af_die "G3: could not read the required checks of PR #$pr;
+${state#error: }
+PR left open." "$AF_EX_GATE" ;;
       timeout)
         gh pr edit "$pr" --repo "$AF_SLUG" --add-label needs-human >/dev/null 2>&1 || true
         af_die "CI did not settle within ${AF_CI_TIMEOUT}s. PR #$pr left open." \
@@ -900,6 +925,9 @@ af_step_merge() {
   case "$state" in
     pass) : ;;
     none) af_die "G3: PR #$pr has no required checks; refusing to merge." "$AF_EX_GATE" ;;
+    error*) af_die "G3: could not read the required checks of PR #$pr;
+${state#error: }
+Refusing to merge." "$AF_EX_GATE" ;;
     *) af_die "G3: PR #$pr checks are '$state'; refusing to merge." "$AF_EX_GATE" ;;
   esac
 

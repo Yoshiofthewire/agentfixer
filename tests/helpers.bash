@@ -54,6 +54,12 @@ stub_gh_side_effect() { printf '%s' "$2" > "$AF_STUB_DIR/gh/$1.sh"; }
 # stub_gh_seq <key> <n> <body>  -- response for the Nth call
 stub_gh_seq() { printf '%s' "$3" > "$AF_STUB_DIR/gh/$1.$2"; }
 
+# stub_gh_fail <key> <exit code> <stderr text>  -- a failing gh call
+stub_gh_fail() {
+  printf '%s' "$2" > "$AF_STUB_DIR/gh/$1.exit"
+  printf '%s\n' "$3" > "$AF_STUB_DIR/gh/$1.err"
+}
+
 # refute_grep <grep args...> -- fails the test if grep MATCHES.
 #
 # Never write `! grep -q ...` in a test body: bash's set -e (and so bats'

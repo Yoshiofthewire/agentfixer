@@ -162,7 +162,7 @@ recommended.
 | 0 | completed |
 | 1 | usage error, or a preflight check failed before the run started — nothing was spent |
 | 2 | CI could not be made green (timed out, or exhausted its retries); the PR is left open, labelled `needs-human` |
-| 3 | a safety gate tripped mid-run: `.github/` was touched (G1), the PR has zero required checks (G3), the merge-time recheck of required checks finds them not passing (G3), the merge itself was refused by GitHub, or `bwrap` is unavailable for a write-mode step and `--no-sandbox` wasn't passed |
+| 3 | a safety gate tripped mid-run: `.github/` was touched (G1), the changed-path list behind G1 could not be read at all, the PR has zero required checks (G3), their state could not be read at all (G3 — a `gh` error is not evidence of anything, so it refuses), the merge-time recheck of required checks finds them not passing (G3), the merge itself was refused by GitHub, or `bwrap` is unavailable for a write-mode step and `--no-sandbox` wasn't passed |
 | 4 | an agent returned invalid, incomplete, or non-schema-conforming output — includes the verify/fix id-set mismatch (G2) and `combine` inventing non-canonical ids |
 
 Codes 2–4 can fire after real spend has already happened (audit and verify

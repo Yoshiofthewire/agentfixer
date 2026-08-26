@@ -36,6 +36,17 @@ setup() {
   refute_grep 'pr merge' "$AF_STUB_DIR/gh/calls.log"
 }
 
+# I7 - a gh failure is not evidence that the checks passed, and it is not
+# evidence that there are none either. Refuse the merge and say what happened.
+@test "G3: refuses to merge when the check state cannot be read" {
+  stub_gh_fail "$(gh_key pr checks)" 1 "HTTP 503: Service unavailable (api.github.com)"
+  run bash -c "$SRC $PREP; af_step_merge 7"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"503"* ]]
+  [[ "$output" != *"has no required checks"* ]]
+  refute_grep 'pr merge' "$AF_STUB_DIR/gh/calls.log"
+}
+
 @test "G1 re-runs against the commit range before merging" {
   stub_gh "$(gh_key pr checks)" '[{"bucket":"pass","name":"t"}]'
   run bash -c "$SRC

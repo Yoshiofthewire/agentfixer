@@ -51,6 +51,42 @@ setup() {
   [ "$output" = "pass" ]
 }
 
+# I7 - af_check_state masked every gh failure as [] -> "none", and af_ci_loop
+# then told the user "PR #N has no required checks. Enable required status
+# checks in branch protection", which is false when the real cause was a gh
+# error. Still fails closed either way; it just has to say which.
+#
+# The two cases are distinguished by gh's own message. Measured against real
+# gh 2.98.0, `gh pr checks <n> --required --json bucket,name`:
+#   zero required checks -> rc=1, empty stdout,
+#                           stderr "no required checks reported on the 'X' branch"
+#   pending / failing     -> rc=0 with JSON (the documented exit 8 applies to
+#                           the human-readable output, not --json)
+@test "gh's genuine no-required-checks failure still reads as none" {
+  stub_gh_fail "$(gh_key pr checks)" 1 "no required checks reported on the 'agentfixer/x' branch"
+  run bash -c "$SRC af_check_state 7"
+  [ "$output" = "none" ]
+}
+
+@test "any other gh failure reads as an error, not as zero required checks" {
+  stub_gh_fail "$(gh_key pr checks)" 1 "HTTP 503: Service unavailable (api.github.com)"
+  run bash -c "$SRC af_check_state 7"
+  [[ "$output" == error* ]]
+  [[ "$output" == *"503"* ]]
+}
+
+@test "the ci loop blames gh, not branch protection, when gh fails" {
+  stub_gh_fail "$(gh_key pr checks)" 1 "HTTP 503: Service unavailable (api.github.com)"
+  run bash -c "$SRC
+    af_setup_run '$REPO' alpha main >/dev/null
+    af_ci_loop '$ITER' 7"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"503"* ]]
+  [[ "$output" != *"no required checks"* ]]
+  [ ! -f "$AF_STUB_DIR/claude/cifix.args" ]
+  grep -q 'needs-human' "$AF_STUB_DIR/gh/calls.log"
+}
+
 @test "wait polls through pending to pass" {
   stub_gh_seq "$(gh_key pr checks)" 1 '[{"bucket":"pending","name":"t"}]'
   stub_gh_seq "$(gh_key pr checks)" 2 '[{"bucket":"pending","name":"t"}]'
