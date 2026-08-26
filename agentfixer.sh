@@ -39,6 +39,95 @@ af_list_repos() {
   done | sort
 }
 
+af_log() { printf '[%s] %s\n' "$1" "$2" >&2; }
+
+# ------------------------------------------------------------ agent wrapper
+AF_SPEND="0"
+
+# af_run_agent STEP MODEL BUDGET MODE SCHEMA OUT LOG PROMPT
+# MODE is "ro" (read-only) or "rw" (write, bypassPermissions).
+# Writes .structured_output to OUT, the raw envelope to LOG.
+af_run_agent() {
+  local step="$1" model="$2" budget="$3" mode="$4" schema="$5"
+  local out="$6" log="$7" prompt="$8"
+  local -a args=(
+    --print --output-format json --no-session-persistence
+    --model "$model" --max-budget-usd "$budget" --json-schema "$schema"
+  )
+  if [ "$mode" = "rw" ]; then
+    args+=(--permission-mode bypassPermissions
+           --disallowed-tools 'WebFetch WebSearch')
+  else
+    args+=(--disallowed-tools 'Edit Write NotebookEdit WebFetch WebSearch')
+  fi
+
+  local rc=0
+  AF_STEP="$step" claude "${args[@]}" "$prompt" > "$log" 2>>"$log.stderr" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    af_die "step '$step': claude exited $rc (see $log)" "$AF_EX_SCHEMA"
+  fi
+  if ! jq -e '.is_error == false and .subtype == "success"' "$log" >/dev/null 2>&1; then
+    af_die "step '$step': agent reported failure (see $log)" "$AF_EX_SCHEMA"
+  fi
+  if ! jq -e '.structured_output != null' "$log" >/dev/null 2>&1; then
+    af_die "step '$step': no structured_output (see $log)" "$AF_EX_SCHEMA"
+  fi
+  jq '.structured_output' "$log" > "$out"
+
+  local cost
+  cost="$(jq -r '.total_cost_usd // 0' "$log")"
+  AF_SPEND="$(awk -v a="$AF_SPEND" -v b="$cost" 'BEGIN{printf "%.2f", a+b}')"
+
+  if jq -e '(.permission_denials | length) > 0' "$log" >/dev/null 2>&1; then
+    af_log warn "step '$step' had tool denials; see $log"
+  fi
+}
+
+# ---------------------------------------------------------------- schemas
+# shellcheck disable=SC2034  # AF_SCHEMA_* are consumed by later pipeline steps
+read -r -d '' AF_SCHEMA_FINDINGS <<'SCHEMA' || true
+{"type":"object","required":["findings"],"properties":{
+ "findings":{"type":"array","items":{"type":"object",
+  "required":["id","severity","file","line","title","blurb","detail","evidence"],
+  "properties":{
+   "id":{"type":"string"},
+   "severity":{"type":"string","enum":["CRITICAL","HIGH","MEDIUM","LOW"]},
+   "file":{"type":"string"},
+   "line":{"type":"integer"},
+   "title":{"type":"string","maxLength":60},
+   "blurb":{"type":"string","maxLength":80},
+   "detail":{"type":"string"},
+   "evidence":{"type":"string"},
+   "source":{"type":"string","enum":["security-audit","hostile-review","both"]}
+  }}}}}
+SCHEMA
+
+# shellcheck disable=SC2034
+read -r -d '' AF_SCHEMA_VERDICTS <<'SCHEMA' || true
+{"type":"object","required":["verdicts"],"properties":{
+ "verdicts":{"type":"array","items":{"type":"object",
+  "required":["id","confirmed","reason"],
+  "properties":{
+   "id":{"type":"string"},
+   "confirmed":{"type":"boolean"},
+   "reason":{"type":"string"},
+   "severity_adjusted":{"type":"string","enum":["CRITICAL","HIGH","MEDIUM","LOW"]}
+  }}}}}
+SCHEMA
+
+# shellcheck disable=SC2034
+read -r -d '' AF_SCHEMA_FIXED <<'SCHEMA' || true
+{"type":"object","required":["results"],"properties":{
+ "results":{"type":"array","items":{"type":"object",
+  "required":["id","status","files_changed"],
+  "properties":{
+   "id":{"type":"string"},
+   "status":{"type":"string","enum":["fixed","skipped"]},
+   "files_changed":{"type":"array","items":{"type":"string"}},
+   "note":{"type":"string"}
+  }}}}}
+SCHEMA
+
 af_main() {
   case "${1:-}" in
     --version) printf 'agentfixer %s\n' "$AF_VERSION"; return 0 ;;
