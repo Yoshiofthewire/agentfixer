@@ -286,6 +286,62 @@ PROMPT
   [ -z "$bad" ] || af_die "combine produced non-canonical ids: $bad" "$AF_EX_SCHEMA"
 }
 
+AF_MODEL_VERIFY="${AF_MODEL_VERIFY:-opus}"
+AF_BUDGET_VERIFY="${AF_BUDGET_VERIFY:-3}"
+
+# G2 - the id set going in must equal the id set coming out, exactly.
+af_assert_id_sets() {
+  local fa="$1" ja="$2" fb="$3" jb="$4" label="$5" a b
+  a="$(jq -c "[$ja] | sort" "$fa")"
+  b="$(jq -c "[$jb] | sort" "$fb")"
+  if [ "$a" != "$b" ]; then
+    af_die "G2 ($label): id set mismatch
+  expected: $a
+  received: $b" "$AF_EX_SCHEMA"
+  fi
+}
+
+af_step_verify() {
+  local iter="$1" prompt
+  prompt="$(cat <<PROMPT
+An unidentified tool produced the claims below about this repository. You do
+not know how it reached them and must not assume competence.
+
+$(cat "$iter/findings.json")
+
+Spawn one subagent per finding. Give each subagent exactly one finding and no
+others - a verifier that has seen the whole list is anchored by the findings it
+is not judging.
+
+Instruct every subagent to attempt to REFUTE its finding by reading the actual
+code, and to return confirmed=false whenever it is uncertain. A false positive
+that reaches the fix stage costs more than a missed finding, which the next
+iteration can catch anyway.
+
+Return exactly one verdict per finding id, no more and no fewer.
+PROMPT
+)"
+  ( cd "$AF_WORKTREE" && af_run_agent verify "$AF_MODEL_VERIFY" \
+      "$AF_BUDGET_VERIFY" ro "$AF_SCHEMA_VERDICTS" \
+      "$iter/verified.json" "$iter/verify.log" "$prompt" ) \
+    || af_die "verify failed" "$?"
+
+  af_assert_id_sets "$iter/findings.json" '.findings[].id' \
+                    "$iter/verified.json" '.verdicts[].id' verify
+}
+
+# Prints the confirmed findings, severity carried over from any adjustment.
+af_confirmed() {
+  local iter="$1"
+  jq -c -s '
+    .[0].findings as $f | .[1].verdicts as $v
+    | [ $v[] | select(.confirmed)
+        | . as $vd
+        | ($f[] | select(.id == $vd.id))
+        | .severity = ($vd.severity_adjusted // .severity) ]
+  ' "$iter/findings.json" "$iter/verified.json"
+}
+
 af_main() {
   # Internal run state is computed by af_setup_run, never inherited. These four
   # gate `git worktree remove --force` and, later, write-mode agent access.
