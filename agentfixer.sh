@@ -420,8 +420,26 @@ $bad" "$AF_EX_GATE"
   fi
 }
 
+# -z is NUL-delimited and never quotes/escapes paths, unlike plain
+# --porcelain: a path containing a space or a quote character silently
+# corrupts awk/field-splitting parses and can hide a .github/ write from G1.
+# For a rename/copy, git emits the new path (status-prefixed) followed by a
+# second NUL-terminated record holding the bare old path; both are printed,
+# so a rename INTO or OUT OF .github/ is visible to the gate either way.
 af_changed_paths() {
-  git -C "$AF_WORKTREE" status --porcelain | awk '{print $NF}'
+  local rec status pending=0
+  while IFS= read -r -d '' rec; do
+    if [ "$pending" = 1 ]; then
+      printf '%s\n' "$rec"
+      pending=0
+      continue
+    fi
+    status="${rec:0:2}"
+    printf '%s\n' "${rec:3}"
+    case "$status" in
+      R*|C*) pending=1 ;;
+    esac
+  done < <(git -C "$AF_WORKTREE" status --porcelain -z)
 }
 
 af_step_fix() {
@@ -458,6 +476,15 @@ PROMPT
 af_commit_fixes() {
   local iter="$1" n="$2" body count msg
   count="$(jq -r '[.results[] | select(.status == "fixed")] | length' "$iter/fixed.json")"
+  # Every finding may come back "skipped" - schema-valid, passes G2, nothing
+  # staged. That is a valid outcome, not a failure: let git's raw "nothing to
+  # commit" (exit 1, this project's usage/preflight code) leak through here
+  # and a clean iteration reads as a preflight bug in a cron log. No-op instead;
+  # the caller can tell nothing was committed because HEAD did not move.
+  if [ "$count" -eq 0 ]; then
+    af_log warn "iteration $n: every finding was skipped, nothing to commit"
+    return 0
+  fi
   body="$(jq -r -s '
     .[0] as $c | .[1].results as $r
     | [ $r[] | select(.status == "fixed") | .id as $id

@@ -74,3 +74,59 @@ README.md'"
   [[ "$output" == *"Co-Authored-By: Claude Opus 5 (1M context)"* ]]
   [[ "$output" == *"HIGH a.ts:1"* ]]
 }
+
+@test "G1 catches a .github path with a space in the name" {
+  # An entirely-untracked .github/ directory collapses to a single "?? .github/"
+  # line in porcelain output regardless of parser, which would match the
+  # gate's prefix check for the wrong reason. Stage the file so git reports
+  # the individual path - this is what actually exercises the awk/quoting bug.
+  stub_claude fix '{"results":[{"id":"F-01-1","status":"fixed","files_changed":["a.ts"]}]}'
+  stub_claude_side_effect fix 'mkdir -p ".github/workflows"
+echo evil > ".github/workflows/ci config.yml"
+git add -A'
+  run bash -c "$SRC AF_SANDBOX=0
+    af_setup_run '$REPO' alpha main >/dev/null
+    af_step_fix '$ITER'"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"G1"* ]]
+}
+
+@test "G1 catches a rename into a spaced path under .github" {
+  stub_claude fix '{"results":[{"id":"F-01-1","status":"fixed","files_changed":["a.ts"]}]}'
+  stub_claude_side_effect fix 'mkdir -p ".github/workflows"
+mv README.md ".github/workflows/renamed backdoor.yml"
+git add -A'
+  run bash -c "$SRC AF_SANDBOX=0
+    af_setup_run '$REPO' alpha main >/dev/null
+    af_step_fix '$ITER'"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"G1"* ]]
+}
+
+@test "G1 catches a .github path containing a newline" {
+  stub_claude fix '{"results":[{"id":"F-01-1","status":"fixed","files_changed":["a.ts"]}]}'
+  stub_claude_side_effect fix 'mkdir -p ".github/workflows"
+f=$(printf "%b" ".github/workflows/evil\nbackdoor.yml")
+echo evil > "$f"
+git add -A'
+  run bash -c "$SRC AF_SANDBOX=0
+    af_setup_run '$REPO' alpha main >/dev/null
+    af_step_fix '$ITER'"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"G1"* ]]
+}
+
+@test "af_commit_fixes is a no-op when every finding was skipped" {
+  cat > "$ITER/fixed.json" <<'J'
+{"results":[{"id":"F-01-1","status":"skipped","files_changed":[],"note":"cannot repro"}]}
+J
+  bash -c "$SRC af_confirmed '$ITER' > '$ITER/confirmed.json'"
+  run bash -c "$SRC
+    af_setup_run '$REPO' alpha main >/dev/null
+    af_commit_fixes '$ITER' 1
+    echo RC=\$?
+    echo COUNT=\$(git -C \"\$AF_WORKTREE\" rev-list --count \"\$AF_BASE_SHA\"..HEAD)"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"RC=0"* ]]
+  [[ "$output" == *"COUNT=0"* ]]
+}
