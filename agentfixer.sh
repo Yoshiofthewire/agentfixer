@@ -179,6 +179,49 @@ read -r -d '' AF_SCHEMA_FIXED <<'SCHEMA' || true
   }}}}}
 SCHEMA
 
+# ------------------------------------------------------------ run lifecycle
+AF_RUN_DIR=""
+AF_WORKTREE=""
+AF_BRANCH=""
+AF_BASE_SHA=""
+
+af_setup_run() {
+  local dir="$1" name="$2" base="$3" stamp
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  AF_RUN_DIR="${AF_CACHE:-$HOME/.cache/agentfixer}/$name/$stamp"
+  AF_WORKTREE="$AF_RUN_DIR/worktree"
+  AF_BRANCH="agentfixer/$stamp"
+  mkdir -p "$AF_RUN_DIR"
+  AF_BASE_SHA="$(git -C "$dir" rev-parse "origin/$base")"
+  git -C "$dir" worktree add --quiet -b "$AF_BRANCH" "$AF_WORKTREE" "$AF_BASE_SHA" \
+    || af_die "could not create worktree at $AF_WORKTREE"
+}
+
+af_iter_dir() {
+  local d
+  d="$(printf '%s/iter-%02d' "$AF_RUN_DIR" "$1")"
+  mkdir -p "$d"
+  printf '%s\n' "$d"
+}
+
+# Conservative: only remove a worktree that is clean AND fully merged.
+# Deleting a worktree holding unmerged work is data loss; tidiness is not
+# worth it.
+af_cleanup_worktree() {
+  local dir="$1"
+  [ -n "$AF_WORKTREE" ] && [ -d "$AF_WORKTREE" ] || return 0
+  if [ -n "$(git -C "$AF_WORKTREE" status --porcelain)" ]; then
+    af_log warn "worktree is dirty, leaving it: $AF_WORKTREE"
+    return 0
+  fi
+  if [ -n "$(git -C "$AF_WORKTREE" log --oneline "$AF_BASE_SHA..HEAD")" ]; then
+    af_log warn "worktree has unmerged commits, leaving it: $AF_WORKTREE"
+    return 0
+  fi
+  git -C "$dir" worktree remove --force "$AF_WORKTREE"
+  git -C "$dir" branch -D "$AF_BRANCH" >/dev/null 2>&1 || true
+}
+
 af_main() {
   case "${1:-}" in
     --version) printf 'agentfixer %s\n' "$AF_VERSION"; return 0 ;;
