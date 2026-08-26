@@ -25,6 +25,13 @@ setup() {
   grep -q -- 'bypassPermissions' "$AF_STUB_DIR/claude/probe.args"
 }
 
+@test "write mode still disallows WebFetch and WebSearch" {
+  stub_claude probe '{}'
+  bash -c "$SRC af_run_agent probe opus 1 rw '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' 'hi'"
+  grep -q -- '--disallowed-tools' "$AF_STUB_DIR/claude/probe.args"
+  grep -q -- 'WebFetch WebSearch' "$AF_STUB_DIR/claude/probe.args"
+}
+
 @test "passes model and budget through" {
   stub_claude probe '{}'
   bash -c "$SRC af_run_agent probe sonnet 3 ro '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' 'hi'"
