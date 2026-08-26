@@ -13,6 +13,21 @@ setup() {
   [ "$output" = "$AF_TMP/ws" ]
 }
 
+# A second install location: the symlink's own directory defines the
+# workspace, even when that directory is not the repo's parent. Without this,
+# a launcher symlink placed anywhere other than the repo's immediate parent
+# silently resolves to the wrong workspace.
+@test "workspace is the symlink's own directory, even when that isn't the repo's parent" {
+  mkdir -p "$AF_TMP/elsewhere/agentfixer"
+  git -C "$AF_TMP/elsewhere/agentfixer" init -q
+  cp "$AF_SCRIPT" "$AF_TMP/elsewhere/agentfixer/agentfixer.sh"
+  mkdir -p "$AF_TMP/ws"
+  ln -s "$AF_TMP/elsewhere/agentfixer/agentfixer.sh" "$AF_TMP/ws/agentfixer.sh"
+  run bash -c "source '$AF_TMP/ws/agentfixer.sh'; af_resolve_workspace"
+  [ "$status" -eq 0 ]
+  [ "$output" = "$AF_TMP/ws" ]
+}
+
 @test "lists sibling git repos and excludes non-repos" {
   make_repo alpha >/dev/null
   make_repo beta >/dev/null

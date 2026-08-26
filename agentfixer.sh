@@ -15,11 +15,27 @@ readonly AF_EX_SCHEMA=4
 af_die() { printf 'agentfixer: %s\n' "$1" >&2; exit "${2:-$AF_EX_USAGE}"; }
 
 # ------------------------------------------------------- workspace discovery
-# The script is run through a symlink in the workspace. Resolve the real path,
-# and if it lives inside a git repo, the workspace is that repo's parent.
+# The invoked path's own location defines the workspace: a launcher symlink
+# placed in a workspace directory means that directory holds the repos, even
+# if the script's own repo lives somewhere else entirely (e.g. two workspaces
+# each with their own symlink to one shared checkout). So if the invoked path
+# is itself a symlink, the workspace is its unresolved directory - we never
+# chase the link. Only when running the real script directly (no symlink in
+# play, as in the repo checkout itself) do we fall back to resolving the real
+# path and using that repo's parent.
 af_resolve_workspace() {
-  local real dir root
-  real="$(readlink -f "${BASH_SOURCE[0]}")"
+  local invoked dir real root
+  invoked="${BASH_SOURCE[0]}"
+  if [ -L "$invoked" ]; then
+    dir="$(dirname "$invoked")"
+    case "$dir" in
+      /*) : ;;
+      *) dir="$(cd "$dir" && pwd)" ;;
+    esac
+    printf '%s\n' "$dir"
+    return
+  fi
+  real="$(readlink -f "$invoked")"
   dir="$(dirname "$real")"
   if root="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)"; then
     dirname "$root"
