@@ -404,6 +404,76 @@ af_confirmed() {
   ' "$iter/findings.json" "$iter/verified.json"
 }
 
+AF_MODEL_FIX="${AF_MODEL_FIX:-opus}"
+AF_BUDGET_FIX="${AF_BUDGET_FIX:-6}"
+AF_TRAILER="Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+
+# G1 - an agent that can edit workflows can make CI green by deleting the
+# tests. Takes paths as one argument, newline separated. Not a pipeline:
+# af_die inside a pipeline exits a subshell the caller never sees.
+af_gate_workflows() {
+  local bad
+  bad="$(printf '%s\n' "$1" | grep -E '^\.github/' || true)"
+  if [ -n "$bad" ]; then
+    af_die "G1: agent modified workflow or CI configuration:
+$bad" "$AF_EX_GATE"
+  fi
+}
+
+af_changed_paths() {
+  git -C "$AF_WORKTREE" status --porcelain | awk '{print $NF}'
+}
+
+af_step_fix() {
+  local iter="$1" prompt confirmed
+  confirmed="$(af_confirmed "$iter")"
+  prompt="$(cat <<PROMPT
+These findings were independently verified as real. Fix all of them.
+
+$confirmed
+
+Rules:
+- Spawn subagents to work in parallel, but group the findings by file first.
+  Run subagents in parallel ACROSS files and sequentially WITHIN a file.
+  Two subagents editing one path concurrently will clobber each other.
+- Fix the defect, not the symptom. Do not suppress, silence, or delete a test.
+- Never create or modify anything under .github/. The run aborts if you do.
+- If the repository has a test command, run it and make it pass.
+- Do not commit. The caller commits.
+- Return one result per finding id. If you cannot fix one, return status
+  "skipped" with a note explaining why. Do not omit it.
+PROMPT
+)"
+  ( cd "$AF_WORKTREE" && af_run_agent fix "$AF_MODEL_FIX" \
+      "$AF_BUDGET_FIX" rw "$AF_SCHEMA_FIXED" \
+      "$iter/fixed.json" "$iter/fix.log" "$prompt" ) \
+    || af_die "fix failed" "$?"
+
+  printf '%s' "$confirmed" > "$iter/confirmed.json"
+  af_assert_id_sets "$iter/confirmed.json" '.[].id' \
+                    "$iter/fixed.json" '.results[].id' fix
+  af_gate_workflows "$(af_changed_paths)"
+}
+
+af_commit_fixes() {
+  local iter="$1" n="$2" body count msg
+  count="$(jq -r '[.results[] | select(.status == "fixed")] | length' "$iter/fixed.json")"
+  body="$(jq -r -s '
+    .[0] as $c | .[1].results as $r
+    | [ $r[] | select(.status == "fixed") | .id as $id
+        | ($c[] | select(.id == $id))
+        | "- \(.severity) \(.file):\(.line) — \(.title)" ] | join("\n")
+  ' "$iter/confirmed.json" "$iter/fixed.json")"
+
+  msg="$(printf 'fix: %s verified findings from agentfixer iteration %d\n\n%s\n\n%s' \
+    "$count" "$n" "$body" "$AF_TRAILER")"
+
+  git -C "$AF_WORKTREE" add -A
+  git -C "$AF_WORKTREE" \
+    -c user.name="agentfixer" -c user.email="noreply@anthropic.com" \
+    commit -q -m "$msg"
+}
+
 af_usage() {
   printf 'usage: agentfixer.sh [--no-sandbox] [--repo NAME] [--iterations N]\n'
 }
