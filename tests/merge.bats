@@ -1,0 +1,135 @@
+setup() {
+  load helpers
+  setup_stub_env
+  # AF_SLUG is normally set by af_preflight; these tests call af_setup_run
+  # directly (as ci.bats/pr.bats do), so it must be set explicitly for A1
+  # (--repo on every gh call) to be exercised for real.
+  SRC="source '$AF_SCRIPT'; AF_POLL=0; AF_SLUG='test/alpha';"
+  REPO="$(make_repo alpha)"
+  add_bare_remote alpha "$REPO"
+  PREP="af_setup_run '$REPO' alpha main >/dev/null
+    echo x > \"\$AF_WORKTREE/a.ts\"
+    git -C \"\$AF_WORKTREE\" add -A
+    git -C \"\$AF_WORKTREE\" -c user.email=t@t -c user.name=t commit -qm fix"
+}
+
+@test "merges when required checks exist and pass" {
+  stub_gh "$(gh_key pr checks)" '[{"bucket":"pass","name":"t"}]'
+  run bash -c "$SRC $PREP; af_step_merge 7"
+  [ "$status" -eq 0 ]
+  grep -q 'pr merge 7' "$AF_STUB_DIR/gh/calls.log"
+  grep -q -- '--squash' "$AF_STUB_DIR/gh/calls.log"
+  grep -q -- '--match-head-commit' "$AF_STUB_DIR/gh/calls.log"
+}
+
+@test "G3: refuses to merge when there are no required checks" {
+  stub_gh "$(gh_key pr checks)" '[]'
+  run bash -c "$SRC $PREP; af_step_merge 7"
+  [ "$status" -eq 3 ]
+  ! grep -q 'pr merge' "$AF_STUB_DIR/gh/calls.log"
+}
+
+@test "G3: refuses to merge on a failing check" {
+  stub_gh "$(gh_key pr checks)" '[{"bucket":"fail","name":"t"}]'
+  run bash -c "$SRC $PREP; af_step_merge 7"
+  [ "$status" -eq 3 ]
+  ! grep -q 'pr merge' "$AF_STUB_DIR/gh/calls.log"
+}
+
+@test "G1 re-runs against the commit range before merging" {
+  stub_gh "$(gh_key pr checks)" '[{"bucket":"pass","name":"t"}]'
+  run bash -c "$SRC
+    af_setup_run '$REPO' alpha main >/dev/null
+    mkdir -p \"\$AF_WORKTREE/.github/workflows\"
+    echo evil > \"\$AF_WORKTREE/.github/workflows/ci.yml\"
+    git -C \"\$AF_WORKTREE\" add -A
+    git -C \"\$AF_WORKTREE\" -c user.email=t@t -c user.name=t commit -qm sneak
+    af_step_merge 7"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"G1"* ]]
+  ! grep -q 'pr merge' "$AF_STUB_DIR/gh/calls.log"
+}
+
+@test "passes the current head sha to --match-head-commit" {
+  stub_gh "$(gh_key pr checks)" '[{"bucket":"pass","name":"t"}]'
+  run bash -c "$SRC $PREP
+    sha=\$(git -C \"\$AF_WORKTREE\" rev-parse HEAD)
+    af_step_merge 7
+    echo SHA=\$sha"
+  sha="$(echo "$output" | sed -n 's/^SHA=//p')"
+  grep -q -- "--match-head-commit $sha" "$AF_STUB_DIR/gh/calls.log"
+}
+
+@test "a refused merge exits 3" {
+  stub_gh "$(gh_key pr checks)" '[{"bucket":"pass","name":"t"}]'
+  printf '1' > "$AF_STUB_DIR/gh/$(gh_key pr merge).exit"
+  run bash -c "$SRC $PREP; af_step_merge 7"
+  [ "$status" -eq 3 ]
+}
+
+# A2 - per-call, not log-wide: no recorded gh call (pr checks or pr merge) may
+# be missing --repo. A log-wide grep -q would pass even if one call site
+# forgot the flag; this inverted form does not.
+@test "every gh call carries --repo" {
+  stub_gh "$(gh_key pr checks)" '[{"bucket":"pass","name":"t"}]'
+  run bash -c "$SRC $PREP; af_step_merge 7"
+  [ "$status" -eq 0 ]
+  run grep -vq -- '--repo test/alpha' "$AF_STUB_DIR/gh/calls.log"
+  [ "$status" -eq 1 ]
+}
+
+# A3 - the pre-merge G1 re-check reads a committed range with `git diff
+# --name-only`, not the working tree. Unlike `git status --porcelain`, plain
+# `git diff --name-only` does NOT quote a path for a bare space (verified
+# empirically) - it only quotes when the path contains a character git's
+# quote_path() treats as unsafe (a literal double quote, backslash, or a
+# non-ASCII byte under the default core.quotepath). So the reproduction
+# needs a name that trips actual quoting, not just any space. This name has
+# both a space and an embedded double quote - quoted without -z as
+# `".github/workflows/ci \"sneaky\".yml"`, which no longer starts with
+# `.github` and slips past the gate's regex.
+
+@test "G1 over the commit range catches a quoted workflow filename (space + quote char)" {
+  stub_gh "$(gh_key pr checks)" '[{"bucket":"pass","name":"t"}]'
+  run bash -c "$SRC
+    af_setup_run '$REPO' alpha main >/dev/null
+    mkdir -p \"\$AF_WORKTREE/.github/workflows\"
+    printf evil > \"\$AF_WORKTREE/.github/workflows/ci \\\"sneaky\\\".yml\"
+    git -C \"\$AF_WORKTREE\" add -A
+    git -C \"\$AF_WORKTREE\" -c user.email=t@t -c user.name=t commit -qm sneak
+    af_step_merge 7"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"G1"* ]]
+  ! grep -q 'pr merge' "$AF_STUB_DIR/gh/calls.log"
+}
+
+# A bare ".github" symlink/gitlink has no character git ever quotes, so this
+# case passes identically with or without -z - it is a regression test that
+# the bare-entry widening (^\.github($|/), fixed for the working-tree path
+# in task 8) still applies through this new call site, not evidence of a
+# -z-specific bypass.
+@test "G1 over the commit range catches a bare .github symlink" {
+  stub_gh "$(gh_key pr checks)" '[{"bucket":"pass","name":"t"}]'
+  run bash -c "$SRC
+    af_setup_run '$REPO' alpha main >/dev/null
+    ln -s evil_target \"\$AF_WORKTREE/.github\"
+    git -C \"\$AF_WORKTREE\" add -A
+    git -C \"\$AF_WORKTREE\" -c user.email=t@t -c user.name=t commit -qm sneak
+    af_step_merge 7"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"G1"* ]]
+  ! grep -q 'pr merge' "$AF_STUB_DIR/gh/calls.log"
+}
+
+@test "G1 over the commit range does not trip on a .githubfoo prefix" {
+  stub_gh "$(gh_key pr checks)" '[{"bucket":"pass","name":"t"}]'
+  run bash -c "$SRC
+    af_setup_run '$REPO' alpha main >/dev/null
+    mkdir -p \"\$AF_WORKTREE/.githubfoo\"
+    echo x > \"\$AF_WORKTREE/.githubfoo/x\"
+    git -C \"\$AF_WORKTREE\" add -A
+    git -C \"\$AF_WORKTREE\" -c user.email=t@t -c user.name=t commit -qm fix
+    af_step_merge 7"
+  [ "$status" -eq 0 ]
+  grep -q 'pr merge 7' "$AF_STUB_DIR/gh/calls.log"
+}

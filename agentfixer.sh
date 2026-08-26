@@ -686,6 +686,39 @@ Halting the run: a PR that cannot be made green means something systemic." \
   done
 }
 
+# -------------------------------------------------------------------- merge
+# -z is NUL-delimited and never quotes/escapes paths, unlike plain
+# --name-only: a path containing a double quote, backslash, or non-ASCII
+# byte is otherwise rewritten with the whole entry wrapped in quotes (e.g.
+# `".github/workflows/ci \"x\".yml"`), which no longer starts with
+# `.github` and silently defeats af_gate_workflows's prefix match. Same
+# hazard af_changed_paths already hardens for the working-tree path; this
+# is the committed-range counterpart used just before merge.
+af_range_paths() {
+  local rec
+  while IFS= read -r -d '' rec; do
+    printf '%s\n' "$rec"
+  done < <(git -C "$AF_WORKTREE" diff --name-only -z "$1")
+}
+
+af_step_merge() {
+  local pr="$1" state head
+  state="$(af_check_state "$pr")"
+  case "$state" in
+    pass) : ;;
+    none) af_die "G3: PR #$pr has no required checks; refusing to merge." "$AF_EX_GATE" ;;
+    *) af_die "G3: PR #$pr checks are '$state'; refusing to merge." "$AF_EX_GATE" ;;
+  esac
+
+  af_gate_workflows "$(af_range_paths "$AF_BASE_SHA..HEAD")"
+
+  head="$(git -C "$AF_WORKTREE" rev-parse HEAD)"
+  ( cd "$AF_WORKTREE" && gh pr merge "$pr" --repo "$AF_SLUG" --squash --delete-branch \
+      --match-head-commit "$head" ) \
+    || af_die "G3: merge of PR #$pr was refused (head moved, or not mergeable)." \
+        "$AF_EX_GATE"
+}
+
 af_usage() {
   printf 'usage: agentfixer.sh [--no-sandbox] [--repo NAME] [--iterations N]\n'
 }

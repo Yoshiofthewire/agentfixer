@@ -10,11 +10,14 @@ n=1
 if [ -f "$n_file" ]; then n=$(( $(cat "$n_file") + 1 )); fi
 printf '%s' "$n" > "$n_file"
 
+# Body and exit code are independent: a test may stub only an exit code
+# (no body) to simulate a bare failure, e.g. `gh pr merge` refusing.
 for f in "$d/$key.$n" "$d/$key"; do
-  if [ -f "$f" ]; then
-    cat "$f"
-    if [ -f "$f.exit" ]; then exit "$(cat "$f.exit")"; fi
-    exit 0
-  fi
+  if [ -f "$f" ]; then cat "$f"; break; fi
 done
-exit 0
+
+rc=0
+for f in "$d/$key.$n.exit" "$d/$key.exit"; do
+  if [ -f "$f" ]; then rc="$(cat "$f")"; break; fi
+done
+exit "$rc"
