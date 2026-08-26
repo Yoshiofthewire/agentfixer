@@ -33,6 +33,17 @@ J
   [[ "$output" == *"**HIGH** \`a.ts:1\` — sqli"* ]]
 }
 
+# I4 - the $rejected jq has an empty-case fallback and the $fixed jq did not,
+# so a results list with nothing "fixed" rendered a blank `### Fixed` section.
+@test "body renders a placeholder when nothing was fixed" {
+  cat > "$ITER/fixed.json" <<'J'
+{"results":[{"id":"F-01-1","status":"skipped","files_changed":[],"note":"cannot repro"}]}
+J
+  run bash -c "$SRC AF_RUN_DIR='$AF_TMP/run'; af_pr_body '$ITER' 1 3"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"### Fixed"$'\n'"_None."* ]]
+}
+
 @test "body lists findings rejected by verification" {
   run bash -c "$SRC AF_RUN_DIR='$AF_TMP/run'; af_pr_body '$ITER' 1 3"
   [[ "$output" == *"Rejected during verification"* ]]

@@ -624,11 +624,12 @@ af_commit_fixes() {
   # Every finding may come back "skipped" - schema-valid, passes G2, nothing
   # staged. That is a valid outcome, not a failure: let git's raw "nothing to
   # commit" (exit 1, this project's usage/preflight code) leak through here
-  # and a clean iteration reads as a preflight bug in a cron log. No-op instead;
-  # the caller can tell nothing was committed because HEAD did not move.
+  # and a clean iteration reads as a preflight bug in a cron log. Report it as
+  # a distinct non-zero status instead, so the caller skips the PR rather than
+  # pushing a zero-commit branch for `gh pr create` to reject.
   if [ "$count" -eq 0 ]; then
     af_log warn "iteration $n: every finding was skipped, nothing to commit"
-    return 0
+    return 1
   fi
   body="$(jq -r -s '
     .[0] as $c | .[1].results as $r
@@ -663,7 +664,8 @@ af_pr_body() {
     .[0] as $c | .[1].results as $r
     | [ $r[] | select(.status == "fixed") | .id as $id
         | ($c[] | select(.id == $id))
-        | "- **\(.severity)** `\(.file):\(.line)` — \(.title)" ] | join("\n")
+        | "- **\(.severity)** `\(.file):\(.line)` — \(.title)" ]
+    | if length == 0 then "_None. Every confirmed finding was skipped._" else join("\n") end
   ' "$iter/confirmed.json" "$iter/fixed.json")"
   rejected="$(jq -r -s '
     .[0].findings as $f | .[1].verdicts as $v
@@ -897,7 +899,7 @@ af_step_merge() {
 AF_DRY_RUN="${AF_DRY_RUN:-0}"
 
 af_run_repo() {
-  local dir="$1" name="$2" iters="$3" base n iter nfind nconf
+  local dir="$1" name="$2" iters="$3" base n iter nfind nconf nfixed
   af_init_display
   AF_REPO_LABEL="$name"
 
@@ -946,8 +948,16 @@ af_run_repo() {
 
     af_status fix active "$nconf findings · parallel subagents"
     af_with_spinner fix af_step_fix "$iter"
-    af_commit_fixes "$iter" "$n"
-    af_status fix "done" "$nconf fixed"
+    # `continue`, not `break`: a later iteration may still land something.
+    if ! af_commit_fixes "$iter" "$n"; then
+      af_status fix "done" "nothing committed"
+      AF_BLURB=""
+      af_log info "iteration $n: nothing committed, no PR"
+      continue
+    fi
+    nfixed="$(jq -r '[.results[] | select(.status == "fixed")] | length' \
+      "$iter/fixed.json")"
+    af_status fix "done" "$nfixed fixed"
     AF_BLURB=""
 
     af_status pr active ""

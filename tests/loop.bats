@@ -76,17 +76,58 @@ printf "{\"verdicts\":[{\"id\":\"%s\",\"confirmed\":false,\"reason\":\"no\"}]}" 
   run bash -c "$SRC af_run_repo '$REPO' alpha 2"
   [ "$status" -eq 0 ]
   [ ! -f "$AF_STUB_DIR/claude/fix.args" ]
-  ! grep -q 'pr create' "$AF_STUB_DIR/gh/calls.log"
+  refute_grep 'pr create' "$AF_STUB_DIR/gh/calls.log"
   [ "$(grep -c 'Run the /security-audit skill' "$AF_STUB_DIR/claude/audit-sec.args")" -eq 2 ]
+}
+
+# I4 - every finding coming back "skipped" leaves HEAD where it was. The run
+# used to walk straight into af_step_pr and push a zero-commit branch, which
+# `gh pr create` rejects; under set -e that ended the whole run with exit 1.
+# Nothing should be pushed, no PR opened, and the next iteration should still
+# get its turn - `continue`, not `break`.
+@test "an iteration where every fix is skipped opens no PR and continues" {
+  stub_claude_side_effect fix '
+p=$(grep -oE "F-[0-9]{2}-[0-9]+" "$AF_STUB_DIR/claude/fix.args" | tail -1)
+printf "{\"results\":[{\"id\":\"%s\",\"status\":\"skipped\",\"files_changed\":[],\"note\":\"cannot repro\"}]}" "$p" > "$AF_STUB_DIR/claude/fix.json"
+'
+  run bash -c "$SRC af_run_repo '$REPO' alpha 2"
+  [ "$status" -eq 0 ]
+  refute_grep 'pr create' "$AF_STUB_DIR/gh/calls.log"
+  [ "$(grep -c 'Run the /security-audit skill' "$AF_STUB_DIR/claude/audit-sec.args")" -eq 2 ]
+  run bash -c "git -C '$AF_TMP/remotes/alpha.git' for-each-ref refs/heads/"
+  [[ "$output" != *"agentfixer/"* ]]
+}
+
+# I4 - the fix line used to print the *confirmed* count, so an iteration that
+# confirmed 2 and fixed 1 displayed "2 fixed".
+@test "the fix step reports the number fixed, not the number confirmed" {
+  stub_claude_side_effect combine '
+p=$(grep -oE "F-[0-9]{2}-" "$AF_STUB_DIR/claude/combine.args" | tail -1)
+printf "{\"findings\":[{\"id\":\"%s1\",\"severity\":\"HIGH\",\"file\":\"a.ts\",\"line\":1,\"title\":\"t\",\"blurb\":\"b\",\"detail\":\"d\",\"evidence\":\"e\"},{\"id\":\"%s2\",\"severity\":\"LOW\",\"file\":\"b.ts\",\"line\":2,\"title\":\"u\",\"blurb\":\"b\",\"detail\":\"d\",\"evidence\":\"e\"}]}" "$p" "$p" > "$AF_STUB_DIR/claude/combine.json"
+'
+  stub_claude_side_effect verify '
+p=$(grep -oE "F-[0-9]{2}-" "$AF_STUB_DIR/claude/verify.args" | tail -1)
+printf "{\"verdicts\":[{\"id\":\"%s1\",\"confirmed\":true,\"reason\":\"real\"},{\"id\":\"%s2\",\"confirmed\":true,\"reason\":\"real\"}]}" "$p" "$p" > "$AF_STUB_DIR/claude/verify.json"
+'
+  stub_claude_side_effect fix '
+p=$(grep -oE "F-[0-9]{2}-" "$AF_STUB_DIR/claude/fix.args" | tail -1)
+printf "{\"results\":[{\"id\":\"%s1\",\"status\":\"fixed\",\"files_changed\":[\"a.ts\"]},{\"id\":\"%s2\",\"status\":\"skipped\",\"files_changed\":[],\"note\":\"n\"}]}" "$p" "$p" > "$AF_STUB_DIR/claude/fix.json"
+echo patched > a.ts
+'
+  run bash -c "$SRC af_run_repo '$REPO' alpha 1"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"2 confirmed"* ]]
+  [[ "$output" == *"1 fixed"* ]]
+  [[ "$output" != *"2 fixed"* ]]
 }
 
 @test "dry-run stops after verify and never branches or pushes" {
   run bash -c "$SRC AF_DRY_RUN=1; af_run_repo '$REPO' alpha 1"
   [ "$status" -eq 0 ]
   [ ! -f "$AF_STUB_DIR/claude/fix.args" ]
-  ! grep -q 'pr create' "$AF_STUB_DIR/gh/calls.log"
+  refute_grep 'pr create' "$AF_STUB_DIR/gh/calls.log"
   run bash -c "git -C '$AF_TMP/remotes/alpha.git' for-each-ref refs/heads/"
-  ! [[ "$output" == *"agentfixer/"* ]]
+  [[ "$output" != *"agentfixer/"* ]]
 }
 
 @test "preflight failure exits 1 before any agent runs" {

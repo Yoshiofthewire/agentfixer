@@ -116,18 +116,23 @@ git add -A'
   [[ "$output" == *"G1"* ]]
 }
 
-@test "af_commit_fixes is a no-op when every finding was skipped" {
+# I4 - every finding coming back "skipped" is schema-valid and passes G2, but
+# leaves HEAD where it was. Reporting that as success sent af_run_repo on to
+# af_step_pr, which pushed a zero-commit branch for `gh pr create` to reject -
+# aborting the run under set -e with exit 1, the code the README documents as
+# "nothing was spent", after a full audit+combine+verify+fix had been paid for.
+# A distinct non-zero status is what lets the caller skip the PR instead.
+@test "af_commit_fixes reports nothing-committed as a non-zero status" {
   cat > "$ITER/fixed.json" <<'J'
 {"results":[{"id":"F-01-1","status":"skipped","files_changed":[],"note":"cannot repro"}]}
 J
   bash -c "$SRC af_confirmed '$ITER' > '$ITER/confirmed.json'"
   run bash -c "$SRC
     af_setup_run '$REPO' alpha main >/dev/null
-    af_commit_fixes '$ITER' 1
-    echo RC=\$?
+    af_commit_fixes '$ITER' 1 || echo RC=\$?
     echo COUNT=\$(git -C \"\$AF_WORKTREE\" rev-list --count \"\$AF_BASE_SHA\"..HEAD)"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"RC=0"* ]]
+  [[ "$output" == *"RC=1"* ]]
   [[ "$output" == *"COUNT=0"* ]]
 }
 
