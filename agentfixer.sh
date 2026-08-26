@@ -226,13 +226,27 @@ af_sandbox_warn() {
 #   - Does NOT hide anything outside $HOME - the whole host filesystem is
 #     bound read-only via --ro-bind / /, so other repos, /etc, and any
 #     world-readable file outside $HOME remain readable inside the sandbox.
+#   - Re-exposes the target repository's git directory, READ-ONLY. A linked
+#     worktree's .git is only a pointer to <repo>/.git/worktrees/<name>, which
+#     lives under $HOME behind the tmpfs; without this bind every git command
+#     inside the sandbox fails with "not a git repository", so the agent
+#     cannot run a test suite that shells out to git, read history, or diff
+#     its own work. Read-only is enough for all three and keeps the property
+#     that only bash ever writes git state. The whole repository history
+#     becomes readable inside the sandbox - it is the repository the agent is
+#     already editing.
 af_sandbox_prefix() {
+  local -a gitdir=()
+  if [ -n "${AF_GITDIR:-}" ]; then
+    gitdir=(--ro-bind "$AF_GITDIR" "$AF_GITDIR")
+  fi
   printf '%s\n' bwrap \
     --ro-bind / / \
     --dev /dev --proc /proc --tmpfs /tmp \
     --tmpfs "$HOME" \
     --ro-bind "$HOME/.claude" "$HOME/.claude" \
     --bind "$AF_WORKTREE" "$AF_WORKTREE" \
+    "${gitdir[@]}" \
     --unshare-pid --new-session --die-with-parent \
     --setenv HOME "$HOME"
 }
@@ -358,6 +372,9 @@ AF_BRANCH="${AF_BRANCH:-}"
 # a local var reads as unbound under set -u. A global survives that.
 AF_REPO_DIR="${AF_REPO_DIR:-}"
 AF_BASE_SHA="${AF_BASE_SHA:-}"
+# Hard-assigned, never from the environment: this path is bound into the
+# write-mode sandbox, so ambient state must not be able to choose it.
+AF_GITDIR=""
 
 af_setup_run() {
   local dir="$1" name="$2" base="$3" stamp
@@ -365,6 +382,11 @@ af_setup_run() {
   AF_RUN_DIR="${AF_CACHE:-$HOME/.cache/agentfixer}/$name/$stamp"
   AF_WORKTREE="$AF_RUN_DIR/worktree"
   AF_BRANCH="agentfixer/$stamp"
+  # Absolute: `rev-parse --git-common-dir` alone prints a path relative to the
+  # repository, which is useless as a bind-mount source. --path-format needs
+  # git >= 2.31.
+  AF_GITDIR="$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir)" \
+    || af_die "could not resolve the git directory of $dir"
   mkdir -p "$AF_RUN_DIR"
   AF_BASE_SHA="$(git -C "$dir" rev-parse "origin/$base")"
   git -C "$dir" worktree add --quiet -b "$AF_BRANCH" "$AF_WORKTREE" "$AF_BASE_SHA" \

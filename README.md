@@ -94,11 +94,13 @@ and `/hostile-review`.
 
 **What the sandbox protects**, precisely:
 
-- `$HOME` is masked by an empty tmpfs, then only `$HOME/.claude` (read-only,
-  so its `settings.json` can't be poisoned to run hooks on your next `claude`
-  session) and the run's own worktree (read-write) are re-exposed inside it.
-  `~/.ssh`, `~/.config/gh`, `~/.aws`, shell history, and any other repo
-  checked out under `$HOME` are unreadable from inside the sandbox.
+- `$HOME` is masked by an empty tmpfs, then three things are re-exposed inside
+  it: `$HOME/.claude` (read-only, so its `settings.json` can't be poisoned to
+  run hooks on your next `claude` session), the run's own worktree
+  (read-write), and the target repository's own `.git` directory (read-only —
+  see below). `~/.ssh`, `~/.config/gh`, `~/.aws`, shell history, and any
+  *other* repo checked out under `$HOME` are unreadable from inside the
+  sandbox.
 - GitHub and SSH credentials (`GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`,
   `GITHUB_ENTERPRISE_TOKEN`, `SSH_AUTH_SOCK`, `GH_CONFIG_DIR`, plus AWS keys)
   are stripped from the write-mode agent's environment unconditionally, even
@@ -114,6 +116,15 @@ and `/hostile-review`.
 - Everything **outside** `$HOME` is bound read-only (`--ro-bind / /`), not
   hidden. `/etc` and any repository not checked out under `$HOME` remain
   readable from inside the sandbox.
+- **The target repository's full git history is readable inside the sandbox.**
+  A `git worktree`'s `.git` is only a pointer file into
+  `<repo>/.git/worktrees/<name>`, which the tmpfs would otherwise hide — and
+  with it hidden, *every* git command inside the sandbox fails with `not a
+  git repository`, so the agent cannot run a test suite that shells out to
+  git, read history, or diff its own work. That directory is therefore bound
+  back in **read-only**: the agent can read the whole history and config of
+  the repo it is already editing, and can write neither. Nothing but bash
+  ever writes git state.
 - Read-only steps run with no sandbox at all, by design (see above).
 
 `$HOME` inside the sandbox is a writable but *empty* tmpfs, so toolchains

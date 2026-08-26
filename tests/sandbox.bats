@@ -24,6 +24,58 @@ setup() {
   ! [[ "$output" == *"--bind"$'\n'"$HOME/.claude"* ]]
 }
 
+# C3 - `git worktree add` leaves $AF_WORKTREE/.git a pointer file to
+# <repo>/.git/worktrees/<name>. In production that gitdir sits under $HOME,
+# which the tmpfs masks, so every git command inside the sandbox died with
+# "fatal: not a git repository: (null)" - the fix agent could not run a suite
+# that shells out to git, and cifix (whose whole job is reproducing a CI
+# failure) could not run one at all. Real bwrap, real git, no stubs.
+@test "CONFINEMENT: git works inside the sandbox for the run's worktree" {
+  command -v bwrap >/dev/null || skip "bwrap not installed"
+  local repo
+  repo="$(make_repo alpha)"
+  git -C "$repo" update-ref refs/remotes/origin/main HEAD
+  mkdir -p "$HOME/.claude"
+  run bash -c "$SRC
+    af_setup_run '$repo' alpha main >/dev/null
+    mapfile -t pfx < <(af_sandbox_prefix)
+    \"\${pfx[@]}\" git -C \"\$AF_WORKTREE\" log --oneline -1
+    \"\${pfx[@]}\" git -C \"\$AF_WORKTREE\" status --porcelain
+    \"\${pfx[@]}\" git -C \"\$AF_WORKTREE\" diff --name-only"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"init"* ]]
+}
+
+# Read-only is sufficient for the agent to inspect history and run a suite,
+# and it preserves the property that only bash ever writes git state.
+@test "CONFINEMENT: the repository gitdir is exposed read-only" {
+  command -v bwrap >/dev/null || skip "bwrap not installed"
+  local repo
+  repo="$(make_repo alpha)"
+  git -C "$repo" update-ref refs/remotes/origin/main HEAD
+  mkdir -p "$HOME/.claude"
+  run bash -c "$SRC
+    af_setup_run '$repo' alpha main >/dev/null
+    mapfile -t pfx < <(af_sandbox_prefix)
+    \"\${pfx[@]}\" bash -c \"echo hack > '$repo/.git/hack'\""
+  [ "$status" -ne 0 ]
+  [ ! -f "$repo/.git/hack" ]
+}
+
+# af_sandbox_prefix is also called directly (unit tests, and the ro path never
+# sandboxes at all), where no run has been set up. An empty AF_GITDIR must
+# produce no bind rather than a bind with an empty path.
+@test "sandbox prefix emits no gitdir bind when no run has been set up" {
+  run bash -c "$SRC AF_WORKTREE=/tmp/wt; AF_GITDIR=''; af_sandbox_prefix"
+  [ "$status" -eq 0 ]
+  [ "$(grep -c '^--ro-bind$' <<<"$output")" -eq 2 ]
+  ! [[ "$output" == *$'\n\n'* ]]
+
+  run bash -c "$SRC AF_WORKTREE=/tmp/wt; AF_GITDIR=/tmp/repo/.git; af_sandbox_prefix"
+  [ "$(grep -c '^--ro-bind$' <<<"$output")" -eq 3 ]
+  [ "$(grep -c '^/tmp/repo/.git$' <<<"$output")" -eq 2 ]
+}
+
 @test "sandbox prefix uses new-session to block TIOCSTI injection" {
   run bash -c "$SRC AF_WORKTREE=/tmp/wt; af_sandbox_prefix"
   [[ "$output" == *"--new-session"* ]]
