@@ -6,9 +6,8 @@ AF_VERSION="0.1.0"
 
 # ---------------------------------------------------------------- exit codes
 readonly AF_EX_USAGE=1
-# shellcheck disable=SC2034  # AF_EX_CI/GATE/SCHEMA are used by later pipeline steps
+# shellcheck disable=SC2034  # AF_EX_CI is used by later pipeline steps
 readonly AF_EX_CI=2
-# shellcheck disable=SC2034
 readonly AF_EX_GATE=3
 # shellcheck disable=SC2034
 readonly AF_EX_SCHEMA=4
@@ -92,11 +91,39 @@ Enable it at: https://github.com/$slug/settings/branches" "$AF_EX_USAGE"
   printf '%s\n' "$base"
 }
 
+# ------------------------------------------------------------------ sandbox
+# Confines write-mode (rw) agents: they ingest untrusted repo content and run
+# with bypassPermissions, so a prompt injection there has unrestricted Bash.
+# Read-only steps are never sandboxed - they need ~/.claude/skills on the real
+# filesystem to resolve /security-audit and /hostile-review.
+AF_SANDBOX="${AF_SANDBOX:-1}"
+
+af_sandbox_available() { command -v bwrap >/dev/null 2>&1; }
+
+af_sandbox_warn() {
+  af_log WARNING "running a write-mode agent unsandboxed; it can read every file your user can, including ~/.ssh and ~/.config/gh"
+}
+
+# Prints the bwrap argv prefix, one argument per line, for mapfile. Pure: no
+# side effects. Order matters - --tmpfs "$HOME" masks the whole home
+# directory, then --ro-bind re-exposes just ~/.claude, read-only, since its
+# settings.json can define hooks that run on the user's next `claude` session.
+af_sandbox_prefix() {
+  printf '%s\n' bwrap \
+    --ro-bind / / \
+    --dev /dev --proc /proc --tmpfs /tmp \
+    --tmpfs "$HOME" \
+    --ro-bind "$HOME/.claude" "$HOME/.claude" \
+    --bind "$AF_WORKTREE" "$AF_WORKTREE" \
+    --unshare-pid --new-session --die-with-parent \
+    --setenv HOME "$HOME"
+}
+
 # ------------------------------------------------------------ agent wrapper
 AF_SPEND="0"
 
 # af_run_agent STEP MODEL BUDGET MODE SCHEMA OUT LOG PROMPT
-# MODE is "ro" (read-only) or "rw" (write, bypassPermissions).
+# MODE is "ro" (read-only) or "rw" (write, bypassPermissions, sandboxed).
 # Writes .structured_output to OUT, the raw envelope to LOG.
 af_run_agent() {
   local step="$1" model="$2" budget="$3" mode="$4" schema="$5"
@@ -105,15 +132,38 @@ af_run_agent() {
     --print --output-format json --no-session-persistence
     --model "$model" --max-budget-usd "$budget" --json-schema "$schema"
   )
+  local -a sandbox_pfx=()
+  local -a cred_scrub=()
   if [ "$mode" = "rw" ]; then
     args+=(--permission-mode bypassPermissions
            --disallowed-tools 'WebFetch WebSearch')
+    # The fix/cifix agents never need GitHub or SSH credentials - bash does
+    # every git push, gh pr create, and gh pr merge in this tool. Scrub them
+    # regardless of AF_SANDBOX: defence in depth against a bind-mount mistake.
+    cred_scrub=(env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN \
+                -u GITHUB_ENTERPRISE_TOKEN -u SSH_AUTH_SOCK -u GH_CONFIG_DIR \
+                -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY)
+    # Create ~/.claude if a fresh runner lacks it, so the ro-bind source
+    # exists; never widen it to a writable bind.
+    mkdir -p "$HOME/.claude"
+    if [ "$AF_SANDBOX" = "1" ]; then
+      af_sandbox_available \
+        || af_die "step '$step': bwrap not found; write-mode steps require bubblewrap for filesystem confinement. Install bubblewrap, or pass --no-sandbox to run unsandboxed (not recommended)." "$AF_EX_GATE"
+      mapfile -t sandbox_pfx < <(af_sandbox_prefix)
+    else
+      af_sandbox_warn
+    fi
   else
     args+=(--disallowed-tools 'Edit Write NotebookEdit WebFetch WebSearch')
   fi
 
   local rc=0
-  AF_STEP="$step" claude "${args[@]}" "$prompt" > "$log" 2>>"$log.stderr" || rc=$?
+  if [ "$mode" = "rw" ]; then
+    AF_STEP="$step" "${sandbox_pfx[@]}" "${cred_scrub[@]}" claude "${args[@]}" "$prompt" \
+      > "$log" 2>>"$log.stderr" || rc=$?
+  else
+    AF_STEP="$step" claude "${args[@]}" "$prompt" > "$log" 2>>"$log.stderr" || rc=$?
+  fi
   if [ "$rc" -ne 0 ]; then
     af_die "step '$step': claude exited $rc (see $log)" "$AF_EX_SCHEMA"
   fi
@@ -342,13 +392,22 @@ af_confirmed() {
   ' "$iter/findings.json" "$iter/verified.json"
 }
 
+af_usage() {
+  printf 'usage: agentfixer.sh [--no-sandbox] [--repo NAME] [--iterations N]\n'
+}
+
 af_main() {
   # Internal run state is computed by af_setup_run, never inherited. These four
   # gate `git worktree remove --force` and, later, write-mode agent access.
   AF_RUN_DIR=""; AF_WORKTREE=""; AF_BRANCH=""; AF_BASE_SHA=""
+  while [ "${1:-}" = "--no-sandbox" ]; do
+    AF_SANDBOX=0
+    af_sandbox_warn
+    shift
+  done
   case "${1:-}" in
     --version) printf 'agentfixer %s\n' "$AF_VERSION"; return 0 ;;
-    -h|--help) printf 'usage: agentfixer.sh [--repo NAME] [--iterations N]\n'; return 0 ;;
+    -h|--help) af_usage; return 0 ;;
     *) af_die "unknown option: ${1:-}" "$AF_EX_USAGE" ;;
   esac
 }
