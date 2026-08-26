@@ -146,8 +146,12 @@ section-6 diff gates trivial to evaluate.
 **5. pr** — shell. Push `agentfixer/<YYYYMMDD-HHMM>-iter<NN>`, then
 `gh pr create`. Body per section 8.
 
-**6. ci** — shell. `gh pr checks --watch --fail-fast --required`. Exit code 8
-means pending. Non-zero after completion routes to `cifix`.
+**6. ci** — shell. Polls `gh pr checks --required --json bucket,name` every
+`AF_POLL` seconds (default 15) until no bucket is `pending`, bounded by
+`AF_CI_TIMEOUT` (default 1800s). Polling rather than `--watch` because a
+blocking watch cannot be driven by a test stub, and the state machine here is
+what most needs proving. `fail` or `cancel` routes to `cifix`; `skipping` does
+not count as failure.
 
 **7. cifix** — shell collects failure context with `gh run view --log-failed`,
 truncated to the last 400 lines per failing job. One fresh agent per attempt,
@@ -397,6 +401,19 @@ auditors write it rather than bash truncating `detail` into nonsense.
 
 A `skipped` result is legal and is reported in the PR body; a *missing* result
 is not, and trips G2.
+
+`CIFIX_SCHEMA` — output of `cifix`:
+
+```json
+{"type":"object","required":["diagnosis","files_changed","confident"],
+ "properties":{
+  "diagnosis":{"type":"string"},
+  "files_changed":{"type":"array","items":{"type":"string"}},
+  "confident":{"type":"boolean"}}}
+```
+
+Nothing branches on `confident`; it is recorded so a human triaging a
+`needs-human` PR can see whether the agent believed its own fix.
 
 ## 13. Testing
 
