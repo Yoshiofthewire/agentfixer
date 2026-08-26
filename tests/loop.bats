@@ -98,6 +98,7 @@ printf "{\"verdicts\":[{\"id\":\"%s\",\"confirmed\":false,\"reason\":\"no\"}]}" 
 
 @test "CI exhaustion halts before the second iteration" {
   stub_gh "$(gh_key pr checks)" '[{"bucket":"fail","name":"t"}]'
+  stub_gh "$(gh_key run list)" '4242'
   stub_gh "$(gh_key run view)" 'FAIL'
   stub_claude cifix '{"diagnosis":"d","files_changed":["a.ts"],"confident":false}'
   stub_claude_side_effect cifix 'echo more > a.ts'

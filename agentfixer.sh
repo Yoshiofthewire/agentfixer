@@ -744,7 +744,21 @@ af_wait_ci() {
 af_step_cifix() {
   local iter="$1" attempt="$2" pr="$3" logs prompt run_id
   af_require_slug
-  logs="$(gh run view --repo "$AF_SLUG" --log-failed 2>/dev/null | tail -n 400 || true)"
+  # `gh run view` with no run id needs a TTY - non-interactively it exits 1
+  # with "run or job ID required when not running interactively" - and even
+  # with a TTY it would pick the repository's most recent run, not this
+  # branch's. Resolve the run explicitly, and never hand the repair agent an
+  # empty log: it edits and pushes under bypassPermissions on whatever
+  # evidence it is given, so no evidence must halt rather than proceed.
+  run_id="$(gh run list --repo "$AF_SLUG" --branch "$AF_BRANCH" --limit 1 \
+    --json databaseId --jq '.[0].databaseId // empty')" \
+    || af_die "cifix: could not list workflow runs for $AF_BRANCH" "$AF_EX_CI"
+  [ -n "$run_id" ] \
+    || af_die "cifix: no workflow run found for $AF_BRANCH" "$AF_EX_CI"
+  logs="$(gh run view "$run_id" --repo "$AF_SLUG" --log-failed | tail -n 400)" \
+    || af_die "cifix: could not read the failing logs of run $run_id" "$AF_EX_CI"
+  [ -n "$logs" ] \
+    || af_die "cifix: run $run_id reported no failing job logs" "$AF_EX_CI"
   prompt="$(cat <<PROMPT
 CI is failing on this branch. The tail of the failing jobs' logs:
 

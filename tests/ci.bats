@@ -77,6 +77,7 @@ setup() {
 @test "one failure then pass runs cifix once" {
   stub_gh_seq "$(gh_key pr checks)" 1 '[{"bucket":"fail","name":"t"}]'
   stub_gh_seq "$(gh_key pr checks)" 2 '[{"bucket":"pass","name":"t"}]'
+  stub_gh "$(gh_key run list)" '4242'
   stub_gh "$(gh_key run view)" 'FAIL: expected 1 got 2'
   stub_claude cifix '{"diagnosis":"off by one","files_changed":["a.ts"],"confident":true}'
   stub_claude_side_effect cifix 'echo fixed > a.ts'
@@ -94,6 +95,7 @@ setup() {
 
 @test "three failures halt the whole run with exit 2 and label the PR" {
   stub_gh "$(gh_key pr checks)" '[{"bucket":"fail","name":"t"}]'
+  stub_gh "$(gh_key run list)" '4242'
   stub_gh "$(gh_key run view)" 'FAIL'
   stub_claude cifix '{"diagnosis":"d","files_changed":["a.ts"],"confident":false}'
   stub_claude_side_effect cifix 'echo again > a.ts'
@@ -111,6 +113,65 @@ setup() {
   [ "$status" -eq 1 ]
 }
 
+# C2 - `gh run view` with no run id exits 1 non-interactively ("run or job ID
+# required when not running interactively"), and even with a TTY would return
+# the repository's most recent run rather than this branch's. Both the branch
+# filter and the resolved id have to appear in the call log, and the log's
+# content has to reach the agent's prompt.
+@test "cifix resolves this branch's failing run and feeds its log to the agent" {
+  stub_gh_seq "$(gh_key pr checks)" 1 '[{"bucket":"fail","name":"t"}]'
+  stub_gh_seq "$(gh_key pr checks)" 2 '[{"bucket":"pass","name":"t"}]'
+  stub_gh "$(gh_key run list)" '4242'
+  stub_gh "$(gh_key run view)" 'FAIL: expected 1 got 2'
+  stub_claude cifix '{"diagnosis":"d","files_changed":["a.ts"],"confident":true}'
+  stub_claude_side_effect cifix 'echo fixed > a.ts'
+  run bash -c "$SRC
+    af_setup_run '$REPO' alpha main >/dev/null
+    git -C \"\$AF_WORKTREE\" push -q --set-upstream origin \"\$AF_BRANCH\"
+    af_ci_loop '$ITER' 7
+    echo BRANCH=\$AF_BRANCH"
+  [ "$status" -eq 0 ]
+  branch="$(sed -n 's/^BRANCH=//p' <<<"$output")"
+  grep -q -- "run list --repo test/alpha --branch $branch" "$AF_STUB_DIR/gh/calls.log"
+  grep -q -- 'run view 4242 --repo test/alpha --log-failed' "$AF_STUB_DIR/gh/calls.log"
+  grep -q 'FAIL: expected 1 got 2' "$AF_STUB_DIR/claude/cifix.args"
+}
+
+# The agent edits and pushes under bypassPermissions. With no log to work
+# from it is guessing, so no log must halt the run rather than start it.
+@test "cifix halts instead of prompting the agent with an empty log" {
+  stub_gh "$(gh_key pr checks)" '[{"bucket":"fail","name":"t"}]'
+  stub_gh "$(gh_key run list)" ''
+  run bash -c "$SRC
+    af_setup_run '$REPO' alpha main >/dev/null
+    af_ci_loop '$ITER' 7"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"no workflow run found"* ]]
+  [ ! -f "$AF_STUB_DIR/claude/cifix.args" ]
+}
+
+@test "cifix halts when the failing run's log cannot be read" {
+  stub_gh "$(gh_key pr checks)" '[{"bucket":"fail","name":"t"}]'
+  stub_gh "$(gh_key run list)" '4242'
+  printf '1' > "$AF_STUB_DIR/gh/$(gh_key run view).exit"
+  run bash -c "$SRC
+    af_setup_run '$REPO' alpha main >/dev/null
+    af_ci_loop '$ITER' 7"
+  [ "$status" -eq 2 ]
+  [ ! -f "$AF_STUB_DIR/claude/cifix.args" ]
+}
+
+@test "cifix halts when the failing run reports no logs at all" {
+  stub_gh "$(gh_key pr checks)" '[{"bucket":"fail","name":"t"}]'
+  stub_gh "$(gh_key run list)" '4242'
+  stub_gh "$(gh_key run view)" ''
+  run bash -c "$SRC
+    af_setup_run '$REPO' alpha main >/dev/null
+    af_ci_loop '$ITER' 7"
+  [ "$status" -eq 2 ]
+  [ ! -f "$AF_STUB_DIR/claude/cifix.args" ]
+}
+
 @test "no required checks halts with exit 3" {
   stub_gh "$(gh_key pr checks)" '[]'
   run bash -c "$SRC
@@ -122,6 +183,7 @@ setup() {
 
 @test "G1 trips if cifix edits a workflow" {
   stub_gh_seq "$(gh_key pr checks)" 1 '[{"bucket":"fail","name":"t"}]'
+  stub_gh "$(gh_key run list)" '4242'
   stub_gh "$(gh_key run view)" 'FAIL'
   stub_claude cifix '{"diagnosis":"d","files_changed":[".github/workflows/ci.yml"],"confident":true}'
   stub_claude_side_effect cifix 'mkdir -p .github/workflows && echo evil > .github/workflows/ci.yml'
