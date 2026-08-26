@@ -108,6 +108,18 @@ af_sandbox_warn() {
 # side effects. Order matters - --tmpfs "$HOME" masks the whole home
 # directory, then --ro-bind re-exposes just ~/.claude, read-only, since its
 # settings.json can define hooks that run on the user's next `claude` session.
+#
+# What this does and does not protect, precisely:
+#   - Protects: everything under $HOME is hidden (masked by the tmpfs),
+#     including ~/.ssh, ~/.config/gh, ~/.aws, shell history, and any other
+#     repo checked out under $HOME. Only $HOME/.claude (read-only) and
+#     $AF_WORKTREE (read-write) are re-exposed.
+#   - Does NOT block network egress - claude is itself an LLM API client, so
+#     unshare-net would break it. This is an accepted residual risk, not an
+#     oversight.
+#   - Does NOT hide anything outside $HOME - the whole host filesystem is
+#     bound read-only via --ro-bind / /, so other repos, /etc, and any
+#     world-readable file outside $HOME remain readable inside the sandbox.
 af_sandbox_prefix() {
   printf '%s\n' bwrap \
     --ro-bind / / \
@@ -399,7 +411,9 @@ af_usage() {
 af_main() {
   # Internal run state is computed by af_setup_run, never inherited. These four
   # gate `git worktree remove --force` and, later, write-mode agent access.
-  AF_RUN_DIR=""; AF_WORKTREE=""; AF_BRANCH=""; AF_BASE_SHA=""
+  # AF_SANDBOX is reset too: ambient environment must not be able to disable
+  # the sandbox without an explicit, logged --no-sandbox flag.
+  AF_RUN_DIR=""; AF_WORKTREE=""; AF_BRANCH=""; AF_BASE_SHA=""; AF_SANDBOX=1
   while [ "${1:-}" = "--no-sandbox" ]; do
     AF_SANDBOX=0
     af_sandbox_warn
