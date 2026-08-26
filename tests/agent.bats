@@ -1,7 +1,9 @@
 setup() {
   load helpers
   setup_stub_env
-  SRC="source '$AF_SCRIPT';"
+  # AF_RUN_DIR set here (not left to default to ".") so af_run_agent's
+  # spend.txt lands in the disposable AF_TMP dir, not the repo working tree.
+  SRC="source '$AF_SCRIPT'; AF_RUN_DIR='$AF_TMP';"
 }
 
 @test "extracts structured_output to the outfile" {
@@ -70,6 +72,6 @@ setup() {
 
 @test "accumulates spend" {
   stub_claude probe '{}'
-  run bash -c "$SRC af_run_agent probe opus 1 ro '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' 'hi'; echo SPEND=\$AF_SPEND"
+  run bash -c "$SRC af_run_agent probe opus 1 ro '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' 'hi'; echo SPEND=\$(af_total_spend)"
   [[ "$output" == *"SPEND=0.01"* ]]
 }

@@ -38,7 +38,99 @@ af_list_repos() {
   done | sort
 }
 
-af_log() { printf '[%s] %s\n' "$1" "$2" >&2; }
+# ------------------------------------------------------------------ display
+AF_PLAIN="${AF_PLAIN:-0}"
+AF_SPIN_POLL="${AF_SPIN_POLL:-1}"
+AF_SPIN_FRAMES='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+AF_REPO_LABEL=""
+AF_ITER_LABEL=""
+AF_BLURB=""
+AF_LINES=0
+AF_STEPS=(audit combine verify fix pr ci merge)
+declare -A AF_STATE=()
+declare -A AF_NOTE=()
+
+af_init_display() {
+  if [ ! -t 1 ]; then AF_PLAIN=1; fi
+  local s
+  for s in "${AF_STEPS[@]}"; do AF_STATE[$s]=pending; AF_NOTE[$s]=""; done
+}
+
+af_log() { printf '%s  %-5s %s\n' "$(date +%H:%M:%S)" "$1" "$2" >&2; }
+
+af_total_spend() {
+  awk '{t += $1} END {printf "%.2f\n", t}' "${AF_RUN_DIR:-.}/spend.txt" 2>/dev/null \
+    || printf '0.00\n'
+}
+
+af_width() { printf '%s' "${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}"; }
+
+# af_set_blurb <json array of findings>
+af_set_blurb() {
+  local w
+  w="$(af_width)"
+  AF_BLURB="$(printf '%s' "$1" | jq -r '
+    .[] | "     \(.severity)  \(.file):\(.line)  \(.blurb)"' \
+    | cut -c "1-$w")"
+}
+
+af_status() {
+  AF_STATE[$1]="$2"
+  AF_NOTE[$1]="${3:-}"
+  af_render "$1"
+}
+
+af_render() {
+  if [ "$AF_PLAIN" = "1" ]; then
+    af_log "${AF_STATE[$1]:-info}" "$(printf '%-8s %s' "$1" "${AF_NOTE[$1]:-}")"
+    [ -n "$AF_BLURB" ] && printf '%s\n' "$AF_BLURB"
+    return 0
+  fi
+  af_render_tty
+}
+
+af_render_tty() {
+  local out="" s mark
+  # Rewind over whatever we drew last time.
+  if [ "$AF_LINES" -gt 0 ]; then
+    printf '\033[%dA\033[J' "$AF_LINES"
+  fi
+  out+=" agentfixer · $AF_REPO_LABEL · $AF_ITER_LABEL"$'\n'
+  out+=" $(printf '─%.0s' $(seq 1 50))"$'\n'
+  for s in "${AF_STEPS[@]}"; do
+    case "${AF_STATE[$s]:-pending}" in
+      done)    mark="✔" ;;
+      failed)  mark="✘" ;;
+      active)  mark="${AF_SPIN_FRAMES:0:1}" ;;
+      *)       mark="·" ;;
+    esac
+    out+="$(printf '  %s %-9s %s' "$mark" "$s" "${AF_NOTE[$s]:-}")"$'\n'
+    if [ "${AF_STATE[$s]:-}" = "active" ] && [ -n "$AF_BLURB" ]; then
+      out+="$AF_BLURB"$'\n'
+    fi
+  done
+  out+=" $(printf '─%.0s' $(seq 1 50))"$'\n'
+  out+=" spent: \$$(af_total_spend)"$'\n'
+  printf '%s' "$out"
+  AF_LINES="$(printf '%s' "$out" | grep -c '')"
+}
+
+# Runs a command in the background and redraws until it exits. kill -0 polls a
+# real condition; nothing here sleeps and hopes, and nothing is killed by name.
+af_with_spinner() {
+  local step="$1"; shift
+  "$@" & local pid=$!
+  local i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$AF_PLAIN" != "1" ]; then
+      AF_SPIN_FRAMES="${AF_SPIN_FRAMES:1}${AF_SPIN_FRAMES:0:1}"
+      af_render "$step"
+    fi
+    if [ "$AF_SPIN_POLL" -gt 0 ]; then sleep "$AF_SPIN_POLL"; else break; fi
+    i=$(( i + 1 ))
+  done
+  wait "$pid"
+}
 
 # ---------------------------------------------------------------- preflight
 AF_SLUG=""
@@ -132,7 +224,6 @@ af_sandbox_prefix() {
 }
 
 # ------------------------------------------------------------ agent wrapper
-AF_SPEND="0"
 
 # af_run_agent STEP MODEL BUDGET MODE SCHEMA OUT LOG PROMPT
 # MODE is "ro" (read-only) or "rw" (write, bypassPermissions, sandboxed).
@@ -187,9 +278,10 @@ af_run_agent() {
   fi
   jq '.structured_output' "$log" > "$out"
 
-  local cost
-  cost="$(jq -r '.total_cost_usd // 0' "$log")"
-  AF_SPEND="$(awk -v a="$AF_SPEND" -v b="$cost" 'BEGIN{printf "%.2f", a+b}')"
+  # Recorded in a file, not a variable: this function runs in background
+  # subshells for the parallel audits and under the spinner, and a subshell's
+  # variable assignments do not reach the parent.
+  jq -r '.total_cost_usd // 0' "$log" >> "${AF_RUN_DIR:-.}/spend.txt"
 
   if jq -e '(.permission_denials | length) > 0' "$log" >/dev/null 2>&1; then
     af_log warn "step '$step' had tool denials; see $log"
