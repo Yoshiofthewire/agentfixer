@@ -571,9 +571,14 @@ $bad" "$AF_EX_GATE"
 # For a rename/copy, git emits the new path (status-prefixed) followed by a
 # second NUL-terminated record holding the bare old path; both are printed,
 # so a rename INTO or OUT OF .github/ is visible to the gate either way.
+#
+# A pipeline, not `done < <(git ...)`: a process substitution's exit status is
+# unobservable, so a failing `git status` would read as a clean tree and G1
+# would pass on it. Under `set -o pipefail` the pipeline - and so this
+# function - carries git's failure to the caller.
 af_changed_paths() {
   local rec status pending=0
-  while IFS= read -r -d '' rec; do
+  git -C "$AF_WORKTREE" status --porcelain -z | while IFS= read -r -d '' rec; do
     if [ "$pending" = 1 ]; then
       printf '%s\n' "$rec"
       pending=0
@@ -584,7 +589,15 @@ af_changed_paths() {
     case "$status" in
       R*|C*) pending=1 ;;
     esac
-  done < <(git -C "$AF_WORKTREE" status --porcelain -z)
+  done
+}
+
+# G1's input producers fail closed: an unreadable path list is not "clean".
+af_gate_changed_paths() {
+  local paths
+  paths="$(af_changed_paths)" \
+    || af_die "G1: could not read the changed paths in $AF_WORKTREE" "$AF_EX_GATE"
+  af_gate_workflows "$paths"
 }
 
 af_step_fix() {
@@ -615,7 +628,7 @@ PROMPT
   printf '%s' "$confirmed" > "$iter/confirmed.json"
   af_assert_id_sets "$iter/confirmed.json" '.[].id' \
                     "$iter/fixed.json" '.results[].id' fix
-  af_gate_workflows "$(af_changed_paths)"
+  af_gate_changed_paths
 }
 
 af_commit_fixes() {
@@ -801,7 +814,7 @@ PROMPT
       "$iter/cifix-$attempt.json" "$iter/cifix-$attempt.log" "$prompt" ) \
     || af_die "cifix attempt $attempt failed" "$?"
 
-  af_gate_workflows "$(af_changed_paths)"
+  af_gate_changed_paths
   # A cifix attempt that makes no net change (or repeats a prior attempt's
   # edit verbatim) leaves nothing to commit. Same as af_commit_fixes: let
   # git's raw "nothing to commit" (exit 1, this project's own usage/preflight
@@ -859,9 +872,13 @@ Halting the run: a PR that cannot be made green means something systemic." \
 # af_changed_paths already hardens for the working-tree path (rename/copy
 # awareness and -z); this is the committed-range counterpart used just
 # before merge, so it must emit both old and new paths for R/C records.
+#
+# A pipeline for the same reason af_changed_paths is one: under pipefail a
+# failing `git diff` reaches the caller, instead of an empty (and so
+# gate-passing) path list.
 af_range_paths() {
   local status old new path
-  while IFS= read -r -d '' status; do
+  git -C "$AF_WORKTREE" diff --name-status -z "$1" | while IFS= read -r -d '' status; do
     case "$status" in
       R*|C*)
         IFS= read -r -d '' old
@@ -873,11 +890,11 @@ af_range_paths() {
         printf '%s\n' "$path"
         ;;
     esac
-  done < <(git -C "$AF_WORKTREE" diff --name-status -z "$1")
+  done
 }
 
 af_step_merge() {
-  local pr="$1" state head
+  local pr="$1" state head paths
   af_require_slug
   state="$(af_check_state "$pr")"
   case "$state" in
@@ -886,7 +903,9 @@ af_step_merge() {
     *) af_die "G3: PR #$pr checks are '$state'; refusing to merge." "$AF_EX_GATE" ;;
   esac
 
-  af_gate_workflows "$(af_range_paths "$AF_BASE_SHA..HEAD")"
+  paths="$(af_range_paths "$AF_BASE_SHA..HEAD")" \
+    || af_die "G1: could not read the merge range $AF_BASE_SHA..HEAD" "$AF_EX_GATE"
+  af_gate_workflows "$paths"
 
   head="$(git -C "$AF_WORKTREE" rev-parse HEAD)"
   ( cd "$AF_WORKTREE" && gh pr merge "$pr" --repo "$AF_SLUG" --squash --delete-branch \

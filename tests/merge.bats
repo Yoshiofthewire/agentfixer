@@ -78,6 +78,27 @@ setup() {
   [ "$status" -eq 1 ]
 }
 
+# I6 - the pre-merge G1 took its input from `$(af_range_paths ...)`, whose
+# exit status was discarded. A failing `git diff --name-status -z` (here: a
+# base sha that is not in the object store) yielded an empty path list, which
+# reads exactly like "this range touches no workflow" - so the gate passed and
+# the merge went ahead. Failing closed is the only acceptable direction.
+@test "af_range_paths fails instead of reporting an empty range" {
+  mkdir -p "$AF_TMP/notarepo"
+  run bash -c "$SRC AF_WORKTREE='$AF_TMP/notarepo'; af_range_paths HEAD~1..HEAD"
+  [ "$status" -ne 0 ]
+}
+
+@test "G1 fails closed when the merge range cannot be read" {
+  stub_gh "$(gh_key pr checks)" '[{"bucket":"pass","name":"t"}]'
+  run bash -c "$SRC $PREP
+    AF_BASE_SHA=0000000000000000000000000000000000000001
+    af_step_merge 7"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"G1"* ]]
+  refute_grep 'pr merge' "$AF_STUB_DIR/gh/calls.log"
+}
+
 # A3 - the pre-merge G1 re-check reads a committed range with `git diff
 # --name-only`, not the working tree. Unlike `git status --porcelain`, plain
 # `git diff --name-only` does NOT quote a path for a bare space (verified

@@ -136,6 +136,28 @@ J
   [[ "$output" == *"COUNT=0"* ]]
 }
 
+# I6 - G1's input came from `$(af_changed_paths)`, whose exit status was
+# discarded. A failing `git status --porcelain -z` produced an empty string,
+# and an empty path list is indistinguishable from a clean tree: the most
+# important gate in the tool failed OPEN. The producer must report the
+# failure, and the gate must treat it as fatal.
+@test "af_changed_paths fails instead of reporting a clean tree" {
+  mkdir -p "$AF_TMP/notarepo"
+  run bash -c "$SRC AF_WORKTREE='$AF_TMP/notarepo'; af_changed_paths"
+  [ "$status" -ne 0 ]
+}
+
+@test "G1 fails closed when the working tree cannot be read" {
+  stub_claude fix '{"results":[{"id":"F-01-1","status":"fixed","files_changed":["a.ts"]}]}'
+  mkdir -p "$AF_TMP/notarepo"
+  run bash -c "$SRC AF_SANDBOX=0
+    af_setup_run '$REPO' alpha main >/dev/null
+    AF_WORKTREE='$AF_TMP/notarepo'
+    af_step_fix '$ITER'"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"G1"* ]]
+}
+
 @test "G1 does not match a .githubfoo prefix" {
   run bash -c "$SRC af_gate_workflows '.githubfoo/x'"
   [ "$status" -eq 0 ]
