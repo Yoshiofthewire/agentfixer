@@ -104,6 +104,36 @@ printf "{\"verdicts\":[{\"id\":\"%s\",\"confirmed\":false,\"reason\":\"no\"}]}" 
   [ "$(grep -c 'Run the /security-audit skill' "$AF_STUB_DIR/claude/audit-sec.args")" -eq 2 ]
 }
 
+# E2 - an iteration that commits nothing used to `continue` without cleaning
+# the worktree, and `checkout -B <branch> <sha>` preserves local modifications
+# when the target commit is already HEAD and never touches untracked files. So
+# iteration 1's scratch was still lying there when iteration 2 ran `git add -A`,
+# and got committed, PR'd and auto-merged under a different finding's
+# provenance - while the log said "iteration 1: nothing committed, no PR".
+@test "an iteration that commits nothing leaves nothing for the next one" {
+  stub_gh_side_effect "$(gh_key pr merge)" ':'
+  stub_claude_side_effect fix '
+p=$(grep -oE "F-[0-9]{2}-[0-9]+" "$AF_STUB_DIR/claude/fix.args" | tail -1)
+case "$p" in
+  F-01-*) echo stray > stray.txt
+          s=skipped ;;
+  *)      echo patched > a.ts
+          s=fixed ;;
+esac
+printf "{\"results\":[{\"id\":\"%s\",\"status\":\"%s\",\"files_changed\":[],\"note\":\"n\"}]}" "$p" "$s" > "$AF_STUB_DIR/claude/fix.json"
+'
+  run bash -c "$SRC af_run_repo '$REPO' alpha 2"
+  [ "$status" -eq 0 ]
+  [ "$(grep -c 'pr create' "$AF_STUB_DIR/gh/calls.log")" -eq 1 ]
+  br="$(git -C "$AF_TMP/remotes/alpha.git" for-each-ref \
+    --format='%(refname:short)' 'refs/heads/agentfixer/*')"
+  [[ "$br" == *iter02 ]]
+  run git -C "$AF_TMP/remotes/alpha.git" ls-tree -r --name-only "$br"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"a.ts"* ]]
+  [[ "$output" != *"stray.txt"* ]]
+}
+
 # I4 - every finding coming back "skipped" leaves HEAD where it was. The run
 # used to walk straight into af_step_pr and push a zero-commit branch, which
 # `gh pr create` rejects; under set -e that ended the whole run with exit 1.

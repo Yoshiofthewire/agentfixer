@@ -1041,6 +1041,17 @@ af_run_repo() {
     # something is work this tool does not delete.
     af_set_iter_branch "$n"
     af_git checkout -q -B "$AF_BRANCH" "$AF_BASE_SHA"
+    # Nothing uncommitted crosses an iteration boundary. An iteration can end
+    # having changed files but committed nothing - every finding skipped, or
+    # every finding rejected - and `checkout -B` keeps local modifications
+    # when the target commit is already HEAD, and never removes untracked
+    # files. That scratch would otherwise be swept up by the next iteration's
+    # `git add -A` and merged under another finding's provenance. Placed here
+    # rather than at each `continue`, so every path back to the top is
+    # covered. Only uncommitted work is discarded; commits are what
+    # af_cleanup_worktree protects, and it still refuses to delete them.
+    af_git reset --hard --quiet "$AF_BASE_SHA"
+    af_git clean -qfd
 
     af_status audit active "2 auditors"
     af_with_spinner audit af_step_audit "$iter"
