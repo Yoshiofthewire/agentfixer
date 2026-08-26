@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # agentfixer - repeated audit/verify/fix/PR/CI/merge loop driven by Claude agents.
+# SPDX-License-Identifier: GPL-3.0-or-later
 set -euo pipefail
 
 AF_VERSION="0.1.0"

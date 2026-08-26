@@ -27,6 +27,18 @@ repo's parent is `~/git`. It never lists itself as a target — the exclusion
 is the repo its own resolved path lives in, whatever that repo is called, so
 an unrelated repo that happens to be named `agentfixer` is still offered.
 
+**Multiple workspaces.** If you keep repos in more than one place (say `~/git`
+and `~/work`), symlink the script into each — the *symlink's own* directory
+defines the workspace, not the target script's repo. A link at `~/work/agentfixer.sh`
+operates on `~/work`'s repos, independent of where the real `agentfixer.sh`
+checkout lives:
+
+```bash
+ln -s ~/git/agentfixer/agentfixer.sh ~/work/agentfixer.sh
+```
+
+`--workspace DIR` overrides whichever workspace either rule would pick.
+
 Requires `claude`, `gh` (authenticated — `gh auth login`), `jq`, and `git`.
 `fzf` is required for the interactive repo picker; `tmux` is required only
 when you select two or more repos at once. `bwrap` (bubblewrap) is required
@@ -223,3 +235,7 @@ shellcheck agentfixer.sh tests/stubs/*
 
 Tests stub `claude` and `gh` on `PATH` and run against real temporary git
 repos. `git` is never stubbed — git behaviour is what needs proving.
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
