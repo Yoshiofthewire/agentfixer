@@ -57,6 +57,30 @@ echo patched > a.ts
   [ "$(grep -c 'Run the /security-audit skill' "$AF_STUB_DIR/claude/audit-sec.args")" -eq 2 ]
 }
 
+# I8 - spec 5.5 and 10 both specify agentfixer/<run>-iter<NN>, and 10 files it
+# under Idempotency. One branch per run only works because GitHub deletes the
+# ref on merge.
+@test "each iteration gets its own branch" {
+  run bash -c "$SRC af_run_repo '$REPO' alpha 2"
+  [ "$status" -eq 0 ]
+  grep -qE -- '--head agentfixer/[0-9]{8}-[0-9]{6}-iter01 ' "$AF_STUB_DIR/gh/calls.log"
+  grep -qE -- '--head agentfixer/[0-9]{8}-[0-9]{6}-iter02 ' "$AF_STUB_DIR/gh/calls.log"
+}
+
+# The failure this actually prevents: with branch deletion restricted (or
+# --delete-branch a no-op), iteration 2's non-force push of the one run-scoped
+# branch name is rejected as non-fast-forward and the run dies with its
+# commits stranded. Overriding the merge side effect removes the simulated
+# remote-branch deletion the other tests in this file rely on.
+@test "a later iteration lands even when the merged branch is not deleted" {
+  stub_gh_side_effect "$(gh_key pr merge)" ':'
+  run bash -c "$SRC af_run_repo '$REPO' alpha 2"
+  [ "$status" -eq 0 ]
+  [ "$(grep -c 'pr create' "$AF_STUB_DIR/gh/calls.log")" -eq 2 ]
+  run bash -c "git -C '$AF_TMP/remotes/alpha.git' for-each-ref --format='%(refname:short)' 'refs/heads/agentfixer/*'"
+  [ "$(printf '%s\n' "$output" | grep -c .)" -eq 2 ]
+}
+
 @test "an audit with no findings stops early and exits 0" {
   stub_claude audit-sec '{"findings":[]}'
   stub_claude audit-hostile '{"findings":[]}'

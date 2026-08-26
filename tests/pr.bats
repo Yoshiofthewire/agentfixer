@@ -124,7 +124,7 @@ J
 
     af_step_pr '$ITER' 1 3 main"
   [ "$status" -ne 0 ]
-  branch="$(grep -o 'BRANCH=agentfixer/[0-9-]*' <<<"$output" | cut -d= -f2)"
+  branch="$(grep -o 'BRANCH=agentfixer/[^ ]*' <<<"$output" | cut -d= -f2)"
   [ -n "$branch" ]
   # The remote ref must still hold the diverging "other" commit unchanged -
   # proof nothing was overwritten, not just that af_step_pr exited nonzero.

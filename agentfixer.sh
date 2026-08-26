@@ -366,6 +366,7 @@ SCHEMA
 AF_RUN_DIR="${AF_RUN_DIR:-}"
 AF_WORKTREE="${AF_WORKTREE:-}"
 AF_BRANCH="${AF_BRANCH:-}"
+AF_RUN_STAMP="${AF_RUN_STAMP:-}"
 # Set by af_run_repo, read by its EXIT trap. A `local` here would not do: a
 # set -e-triggered exit (as opposed to an explicit `exit` call) fires the
 # trap after the failing function's local scope has already been popped, so
@@ -376,12 +377,22 @@ AF_BASE_SHA="${AF_BASE_SHA:-}"
 # write-mode sandbox, so ambient state must not be able to choose it.
 AF_GITDIR=""
 
+# Spec 5.5 and 10: agentfixer/<run>-iter<NN>. One branch per ITERATION, not
+# per run - a run whose merged branch is not deleted (deletion restricted, or
+# --delete-branch a no-op) would otherwise have the next iteration push a
+# non-fast-forward update to the same ref, be rejected, and die with its
+# commits stranded.
+af_set_iter_branch() {
+  AF_BRANCH="$(printf 'agentfixer/%s-iter%02d' "$AF_RUN_STAMP" "$1")"
+}
+
 af_setup_run() {
   local dir="$1" name="$2" base="$3" stamp
   stamp="$(date +%Y%m%d-%H%M%S)"
   AF_RUN_DIR="${AF_CACHE:-$HOME/.cache/agentfixer}/$name/$stamp"
   AF_WORKTREE="$AF_RUN_DIR/worktree"
-  AF_BRANCH="agentfixer/$stamp"
+  AF_RUN_STAMP="$stamp"
+  af_set_iter_branch 1
   # Absolute: `rev-parse --git-common-dir` alone prints a path relative to the
   # repository, which is useless as a bind-mount source. --path-format needs
   # git >= 2.31.
@@ -959,6 +970,12 @@ af_run_repo() {
   for (( n = 1; n <= iters; n++ )); do
     AF_ITER_LABEL="iteration $n/$iters"
     iter="$(af_iter_dir "$n")"
+    # Each iteration starts from the current base on its own branch. The
+    # previous iteration's branch is left alone: after a merge it was reset to
+    # this same base sha and holds nothing, and a branch that does hold
+    # something is work this tool does not delete.
+    af_set_iter_branch "$n"
+    git -C "$AF_WORKTREE" checkout -q -B "$AF_BRANCH" "$AF_BASE_SHA"
 
     af_status audit active "2 auditors"
     af_with_spinner audit af_step_audit "$iter"
