@@ -130,3 +130,29 @@ J
   [[ "$output" == *"RC=0"* ]]
   [[ "$output" == *"COUNT=0"* ]]
 }
+
+@test "G1 does not match a .githubfoo prefix" {
+  run bash -c "$SRC af_gate_workflows '.githubfoo/x'"
+  [ "$status" -eq 0 ]
+}
+
+@test "G1 catches a symlink named exactly .github" {
+  stub_claude fix '{"results":[{"id":"F-01-1","status":"fixed","files_changed":["a.ts"]}]}'
+  stub_claude_side_effect fix 'ln -s evil_target .github
+git add -A'
+  run bash -c "$SRC AF_SANDBOX=0
+    af_setup_run '$REPO' alpha main >/dev/null
+    af_step_fix '$ITER'"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"G1"* ]]
+}
+
+@test "G1 catches a gitlink at exactly .github" {
+  stub_claude fix '{"results":[{"id":"F-01-1","status":"fixed","files_changed":["a.ts"]}]}'
+  stub_claude_side_effect fix 'git update-index --add --cacheinfo 160000,0000000000000000000000000000000000000001,.github'
+  run bash -c "$SRC AF_SANDBOX=0
+    af_setup_run '$REPO' alpha main >/dev/null
+    af_step_fix '$ITER'"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"G1"* ]]
+}

@@ -411,9 +411,13 @@ AF_TRAILER="Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 # G1 - an agent that can edit workflows can make CI green by deleting the
 # tests. Takes paths as one argument, newline separated. Not a pipeline:
 # af_die inside a pipeline exits a subshell the caller never sees.
+# ($|/) rather than a bare /: a symlink or gitlink mounted at exactly
+# .github (no pre-existing tracked .github/ entry to expand into a
+# directory) is reported by git status as the bare string ".github", with
+# no trailing slash, and a plain ^\.github/ prefix match misses it.
 af_gate_workflows() {
   local bad
-  bad="$(printf '%s\n' "$1" | grep -E '^\.github/' || true)"
+  bad="$(printf '%s\n' "$1" | grep -E '^\.github($|/)' || true)"
   if [ -n "$bad" ]; then
     af_die "G1: agent modified workflow or CI configuration:
 $bad" "$AF_EX_GATE"
