@@ -505,6 +505,78 @@ af_commit_fixes() {
     commit -q -m "$msg"
 }
 
+# ---------------------------------------------------------------- pull request
+AF_PR_NUM=""
+AF_PR_URL=""
+
+af_ensure_labels() {
+  gh label create agent-authored --repo "$AF_SLUG" --color B60205 \
+    --description "Authored by an automated agent" >/dev/null 2>&1 || true
+  gh label create agentfixer --repo "$AF_SLUG" --color 0E8A16 \
+    --description "Opened by agentfixer" >/dev/null 2>&1 || true
+}
+
+af_pr_body() {
+  local iter="$1" n="$2" total="$3" fixed rejected
+  fixed="$(jq -r -s '
+    .[0] as $c | .[1].results as $r
+    | [ $r[] | select(.status == "fixed") | .id as $id
+        | ($c[] | select(.id == $id))
+        | "- **\(.severity)** `\(.file):\(.line)` — \(.title)" ] | join("\n")
+  ' "$iter/confirmed.json" "$iter/fixed.json")"
+  rejected="$(jq -r -s '
+    .[0].findings as $f | .[1].verdicts as $v
+    | [ $v[] | select(.confirmed | not) | . as $vd
+        | ($f[] | select(.id == $vd.id))
+        | "- `\(.file):\(.line)` — \(.title). \($vd.reason) Not changed." ]
+    | if length == 0 then "_None. Every finding was confirmed._" else join("\n") end
+  ' "$iter/findings.json" "$iter/verified.json")"
+
+  cat <<BODY
+## agentfixer · iteration $n/$total
+
+Agent-authored. Findings produced by \`security-audit\` and \`hostile-review\`,
+then independently re-verified in isolated contexts before any code changed.
+
+### Fixed
+$fixed
+
+### Rejected during verification
+$rejected
+
+### Provenance
+| step | model |
+|---|---|
+| audit | $AF_MODEL_AUDIT |
+| combine | $AF_MODEL_COMBINE |
+| verify | $AF_MODEL_VERIFY |
+| fix | $AF_MODEL_FIX |
+
+Run log: \`$AF_RUN_DIR\`
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+BODY
+}
+
+af_step_pr() {
+  local iter="$1" n="$2" total="$3" base="$4" title bodyfile
+  bodyfile="$iter/pr-body.md"
+  af_pr_body "$iter" "$n" "$total" > "$bodyfile"
+  title="fix: $(jq -r '[.results[] | select(.status == "fixed")] | length' \
+    "$iter/fixed.json") verified findings (agentfixer $n/$total)"
+
+  git -C "$AF_WORKTREE" push --quiet --set-upstream origin "$AF_BRANCH"
+  af_ensure_labels
+
+  AF_PR_URL="$(cd "$AF_WORKTREE" && gh pr create --repo "$AF_SLUG" \
+    --base "$base" --head "$AF_BRANCH" \
+    --title "$title" --body-file "$bodyfile" \
+    --label agent-authored --label agentfixer)"
+  AF_PR_NUM="${AF_PR_URL##*/}"
+  printf '%s\n' "$AF_PR_URL" > "$iter/pr.txt"
+  [ -n "$AF_PR_NUM" ] || af_die "could not determine PR number from: $AF_PR_URL"
+}
+
 af_usage() {
   printf 'usage: agentfixer.sh [--no-sandbox] [--repo NAME] [--iterations N]\n'
 }
