@@ -10,8 +10,7 @@ setup_stub_env() {
   mkdir -p "$AF_STUB_DIR/claude" "$AF_STUB_DIR/gh" "$AF_TMP/bin"
   cp "$AF_ROOT/tests/stubs/claude" "$AF_TMP/bin/claude"
   cp "$AF_ROOT/tests/stubs/gh" "$AF_TMP/bin/gh"
-  cp "$AF_ROOT/tests/stubs/git" "$AF_TMP/bin/git"
-  chmod +x "$AF_TMP/bin/claude" "$AF_TMP/bin/gh" "$AF_TMP/bin/git"
+  chmod +x "$AF_TMP/bin/claude" "$AF_TMP/bin/gh"
   export PATH="$AF_TMP/bin:$PATH"
   export HOME="$AF_TMP/home"
   mkdir -p "$HOME"
@@ -54,3 +53,14 @@ gh_calls() { cat "$AF_STUB_DIR/gh/calls.log" 2>/dev/null || true; }
 
 # gh_key <arg1> <arg2> -- mirrors the sanitizing in tests/stubs/gh
 gh_key() { printf '%s_%s' "${1:-}" "${2:-}" | tr -c 'a-zA-Z0-9' '_'; }
+
+# add_bare_remote <name> <repo_dir>
+add_bare_remote() {
+  local name="$1" repo="$2"
+  mkdir -p "$AF_TMP/remotes"
+  git init -q --bare "$AF_TMP/remotes/$name.git"
+  git -C "$repo" config "url.$AF_TMP/remotes/.insteadOf" "https://github.com/test/"
+  git -C "$repo" push -q origin main
+  git -C "$repo" fetch -q origin
+  git -C "$repo" remote set-head origin main
+}

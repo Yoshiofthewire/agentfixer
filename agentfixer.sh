@@ -46,7 +46,7 @@ AF_SLUG=""
 
 af_repo_slug() {
   local url
-  url="$(git -C "$1" remote get-url origin 2>/dev/null)" || return 1
+  url="$(git -C "$1" config --get remote.origin.url 2>/dev/null)" || return 1
   url="${url%.git}"
   case "$url" in
     git@github.com:*) printf '%s\n' "${url#git@github.com:}" ;;

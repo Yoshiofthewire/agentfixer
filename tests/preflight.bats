@@ -3,6 +3,7 @@ setup() {
   setup_stub_env
   SRC="source '$AF_SCRIPT';"
   REPO="$(make_repo alpha)"
+  add_bare_remote alpha "$REPO"
   stub_gh "$(gh_key auth status)" ""
 }
 
