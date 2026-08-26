@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Programmable `gh` stub. Key is the first two args, sanitized.
+set -euo pipefail
+d="${AF_STUB_DIR:?AF_STUB_DIR unset}/gh"
+printf '%s\n' "$*" >> "$d/calls.log"
+
+key="$(printf '%s_%s' "${1:-}" "${2:-}" | tr -c 'a-zA-Z0-9' '_')"
+n_file="$d/$key.n"
+n=1
+if [ -f "$n_file" ]; then n=$(( $(cat "$n_file") + 1 )); fi
+printf '%s' "$n" > "$n_file"
+
+# Optional side effect (e.g. simulating a real GitHub action the fake gh
+# can't perform on its own, like deleting a remote branch on merge).
+if [ -f "$d/$key.sh" ]; then
+  bash "$d/$key.sh"
+fi
+
+# Body and exit code are independent: a test may stub only an exit code
+# (no body) to simulate a bare failure, e.g. `gh pr merge` refusing.
+for f in "$d/$key.$n" "$d/$key"; do
+  if [ -f "$f" ]; then cat "$f"; break; fi
+done
+
+# Stderr is independent too: real gh reports "no required checks reported on
+# the 'x' branch" there, with exit 1 and empty stdout, and agentfixer has to
+# tell that apart from a transport failure.
+for f in "$d/$key.$n.err" "$d/$key.err"; do
+  if [ -f "$f" ]; then cat "$f" >&2; break; fi
+done
+
+rc=0
+for f in "$d/$key.$n.exit" "$d/$key.exit"; do
+  if [ -f "$f" ]; then rc="$(cat "$f")"; break; fi
+done
+exit "$rc"
