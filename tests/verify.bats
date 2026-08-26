@@ -44,7 +44,7 @@ J
 @test "verify is read-only" {
   stub_claude verify '{"verdicts":[{"id":"F-01-1","confirmed":true,"reason":"r"},{"id":"F-01-2","confirmed":true,"reason":"r"}]}'
   bash -c "$SRC af_step_verify '$ITER'"
-  ! grep -q 'bypassPermissions' "$AF_STUB_DIR/claude/verify.args"
+  refute_grep 'bypassPermissions' "$AF_STUB_DIR/claude/verify.args"
 }
 
 @test "verify prompt instructs refute-by-default" {

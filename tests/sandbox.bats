@@ -21,7 +21,7 @@ setup() {
   run bash -c "$SRC AF_WORKTREE=/tmp/wt; af_sandbox_prefix"
   [[ "$output" == *"--ro-bind"* ]]
   [[ "$output" == *"$HOME/.claude"* ]]
-  ! [[ "$output" == *"--bind"$'\n'"$HOME/.claude"* ]]
+  [[ "$output" != *"--bind"$'\n'"$HOME/.claude"* ]]
 }
 
 # C3 - `git worktree add` leaves $AF_WORKTREE/.git a pointer file to
@@ -69,7 +69,7 @@ setup() {
   run bash -c "$SRC AF_WORKTREE=/tmp/wt; AF_GITDIR=''; af_sandbox_prefix"
   [ "$status" -eq 0 ]
   [ "$(grep -c '^--ro-bind$' <<<"$output")" -eq 2 ]
-  ! [[ "$output" == *$'\n\n'* ]]
+  [[ "$output" != *$'\n\n'* ]]
 
   run bash -c "$SRC AF_WORKTREE=/tmp/wt; AF_GITDIR=/tmp/repo/.git; af_sandbox_prefix"
   [ "$(grep -c '^--ro-bind$' <<<"$output")" -eq 3 ]
@@ -153,7 +153,7 @@ setup() {
     mapfile -t pfx < <(af_sandbox_prefix)
     \"\${pfx[@]}\" cat '$HOME/.ssh/id_test'"
   [ "$status" -ne 0 ]
-  ! [[ "$output" == *"SUPERSECRET"* ]]
+  [[ "$output" != *"SUPERSECRET"* ]]
 }
 
 @test "CONFINEMENT: the worktree is writable inside the sandbox" {

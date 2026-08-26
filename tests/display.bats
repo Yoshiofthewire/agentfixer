@@ -60,7 +60,7 @@ setup() {
 
 @test "plain mode emits no ANSI escapes" {
   run bash -c "$SRC af_status audit active 'x'"
-  ! [[ "$output" == *$'\e['* ]]
+  [[ "$output" != *$'\e['* ]]
 }
 
 @test "blurb renders severity, location and text" {

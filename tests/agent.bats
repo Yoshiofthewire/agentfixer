@@ -18,7 +18,7 @@ setup() {
   bash -c "$SRC af_run_agent probe opus 1 ro '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' 'hi'"
   grep -q -- '--disallowed-tools' "$AF_STUB_DIR/claude/probe.args"
   grep -q -- 'Edit Write' "$AF_STUB_DIR/claude/probe.args"
-  ! grep -q -- 'bypassPermissions' "$AF_STUB_DIR/claude/probe.args"
+  refute_grep -- 'bypassPermissions' "$AF_STUB_DIR/claude/probe.args"
 }
 
 # AF_SANDBOX=0 here: these tests check argv construction, not sandboxing

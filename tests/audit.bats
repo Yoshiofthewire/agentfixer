@@ -24,7 +24,7 @@ FIND='{"findings":[{"id":"a1","severity":"HIGH","file":"x.ts","line":1,"title":"
   stub_claude audit-hostile "$FIND"
   bash -c "$SRC af_step_audit '$ITER'"
   grep -q 'Edit Write' "$AF_STUB_DIR/claude/audit-sec.args"
-  ! grep -q 'bypassPermissions' "$AF_STUB_DIR/claude/audit-sec.args"
+  refute_grep 'bypassPermissions' "$AF_STUB_DIR/claude/audit-sec.args"
 }
 
 @test "auditors invoke their skills" {

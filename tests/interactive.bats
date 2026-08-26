@@ -76,10 +76,15 @@ beta' 3 </dev/null"
   grep -q -- '--yes' "$AF_STUB_DIR/tmux.log"
 }
 
+# `TMUX=val $SRC ...` does not work, for the same reason the AF_STUB_FZF note
+# above gives: a command-prefix assignment on `source` does not survive it.
+# With the negated assertion below made effective (see refute_grep), this test
+# failed - it had been taking the new-session branch all along, because TMUX
+# was never actually set inside the shell that ran af_launch_tmux.
 @test "inside tmux it adds windows instead of nesting a session" {
-  run bash -c "TMUX=/tmp/fake,1,0 $SRC af_launch_tmux 1 alpha beta"
+  run bash -c "$SRC export TMUX=/tmp/fake,1,0; af_launch_tmux 1 alpha beta"
   [ "$status" -eq 0 ]
-  ! grep -q 'new-session' "$AF_STUB_DIR/tmux.log"
+  refute_grep 'new-session' "$AF_STUB_DIR/tmux.log"
   grep -q 'new-window' "$AF_STUB_DIR/tmux.log"
 }
 

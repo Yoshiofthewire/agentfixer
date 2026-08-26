@@ -54,6 +54,21 @@ stub_gh_side_effect() { printf '%s' "$2" > "$AF_STUB_DIR/gh/$1.sh"; }
 # stub_gh_seq <key> <n> <body>  -- response for the Nth call
 stub_gh_seq() { printf '%s' "$3" > "$AF_STUB_DIR/gh/$1.$2"; }
 
+# refute_grep <grep args...> -- fails the test if grep MATCHES.
+#
+# Never write `! grep -q ...` in a test body: bash's set -e (and so bats'
+# failure detection) explicitly exempts a command whose status is inverted
+# with `!`, so unless it happens to be the very last statement of the test,
+# a negated assertion is silently ignored and can never fail. Verified
+# against bats 1.14: a mid-body `! grep -q PRESENT file` reports `ok`.
+# A function that `return 1`s is a plain command failure, which is caught.
+refute_grep() {
+  if grep -q "$@"; then
+    printf 'refute_grep: unexpectedly matched: %s\n' "$*" >&2
+    return 1
+  fi
+}
+
 gh_calls() { cat "$AF_STUB_DIR/gh/calls.log" 2>/dev/null || true; }
 
 tmux_calls() { cat "$AF_STUB_DIR/tmux.log" 2>/dev/null || true; }

@@ -26,14 +26,14 @@ setup() {
   stub_gh "$(gh_key pr checks)" '[]'
   run bash -c "$SRC $PREP; af_step_merge 7"
   [ "$status" -eq 3 ]
-  ! grep -q 'pr merge' "$AF_STUB_DIR/gh/calls.log"
+  refute_grep 'pr merge' "$AF_STUB_DIR/gh/calls.log"
 }
 
 @test "G3: refuses to merge on a failing check" {
   stub_gh "$(gh_key pr checks)" '[{"bucket":"fail","name":"t"}]'
   run bash -c "$SRC $PREP; af_step_merge 7"
   [ "$status" -eq 3 ]
-  ! grep -q 'pr merge' "$AF_STUB_DIR/gh/calls.log"
+  refute_grep 'pr merge' "$AF_STUB_DIR/gh/calls.log"
 }
 
 @test "G1 re-runs against the commit range before merging" {
@@ -47,7 +47,7 @@ setup() {
     af_step_merge 7"
   [ "$status" -eq 3 ]
   [[ "$output" == *"G1"* ]]
-  ! grep -q 'pr merge' "$AF_STUB_DIR/gh/calls.log"
+  refute_grep 'pr merge' "$AF_STUB_DIR/gh/calls.log"
 }
 
 @test "passes the current head sha to --match-head-commit" {
@@ -100,7 +100,7 @@ setup() {
     af_step_merge 7"
   [ "$status" -eq 3 ]
   [[ "$output" == *"G1"* ]]
-  ! grep -q 'pr merge' "$AF_STUB_DIR/gh/calls.log"
+  refute_grep 'pr merge' "$AF_STUB_DIR/gh/calls.log"
 }
 
 # A bare ".github" symlink/gitlink has no character git ever quotes, so this
@@ -118,7 +118,7 @@ setup() {
     af_step_merge 7"
   [ "$status" -eq 3 ]
   [[ "$output" == *"G1"* ]]
-  ! grep -q 'pr merge' "$AF_STUB_DIR/gh/calls.log"
+  refute_grep 'pr merge' "$AF_STUB_DIR/gh/calls.log"
 }
 
 @test "G1 over the commit range does not trip on a .githubfoo prefix" {
@@ -158,7 +158,7 @@ setup() {
     af_step_merge 7"
   [ "$status" -eq 3 ]
   [[ "$output" == *"G1"* ]]
-  ! grep -q 'pr merge' "$AF_STUB_DIR/gh/calls.log"
+  refute_grep 'pr merge' "$AF_STUB_DIR/gh/calls.log"
 }
 
 # The mirror case: a rename INTO .github/workflows already carries the new
@@ -180,5 +180,5 @@ setup() {
     af_step_merge 7"
   [ "$status" -eq 3 ]
   [[ "$output" == *"G1"* ]]
-  ! grep -q 'pr merge' "$AF_STUB_DIR/gh/calls.log"
+  refute_grep 'pr merge' "$AF_STUB_DIR/gh/calls.log"
 }
