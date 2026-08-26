@@ -180,10 +180,10 @@ read -r -d '' AF_SCHEMA_FIXED <<'SCHEMA' || true
 SCHEMA
 
 # ------------------------------------------------------------ run lifecycle
-AF_RUN_DIR=""
-AF_WORKTREE=""
-AF_BRANCH=""
-AF_BASE_SHA=""
+AF_RUN_DIR="${AF_RUN_DIR:-}"
+AF_WORKTREE="${AF_WORKTREE:-}"
+AF_BRANCH="${AF_BRANCH:-}"
+AF_BASE_SHA="${AF_BASE_SHA:-}"
 
 af_setup_run() {
   local dir="$1" name="$2" base="$3" stamp
@@ -220,6 +220,70 @@ af_cleanup_worktree() {
   fi
   git -C "$dir" worktree remove --force "$AF_WORKTREE"
   git -C "$dir" branch -D "$AF_BRANCH" >/dev/null 2>&1 || true
+}
+
+# --------------------------------------------------------------- pipeline
+AF_MODEL_AUDIT="${AF_MODEL_AUDIT:-opus}"
+AF_MODEL_COMBINE="${AF_MODEL_COMBINE:-sonnet}"
+AF_BUDGET_AUDIT="${AF_BUDGET_AUDIT:-3}"
+AF_BUDGET_COMBINE="${AF_BUDGET_COMBINE:-1}"
+
+af_prompt_audit() {
+  cat <<PROMPT
+Run the /$1 skill against this repository.
+
+Report every finding as a structured record. Rules:
+- Only report defects you can point at in the code. No speculation.
+- 'evidence' must quote the actual offending code or command output.
+- 'blurb' is a single line under 80 characters for a terminal display.
+- 'id' may be any unique string; it will be reassigned downstream.
+- If you find nothing, return an empty findings array. That is a valid answer.
+PROMPT
+}
+
+af_step_audit() {
+  local iter="$1" pid_s pid_h
+  ( cd "$AF_WORKTREE" && af_run_agent audit-sec "$AF_MODEL_AUDIT" \
+      "$AF_BUDGET_AUDIT" ro "$AF_SCHEMA_FINDINGS" \
+      "$iter/audit-sec.json" "$iter/audit-sec.log" \
+      "$(af_prompt_audit security-audit)" ) & pid_s=$!
+  ( cd "$AF_WORKTREE" && af_run_agent audit-hostile "$AF_MODEL_AUDIT" \
+      "$AF_BUDGET_AUDIT" ro "$AF_SCHEMA_FINDINGS" \
+      "$iter/audit-hostile.json" "$iter/audit-hostile.log" \
+      "$(af_prompt_audit hostile-review)" ) & pid_h=$!
+  wait "$pid_s" || af_die "audit-sec failed" "$?"
+  wait "$pid_h" || af_die "audit-hostile failed" "$?"
+}
+
+af_step_combine() {
+  local iter="$1" n="$2" prompt bad
+  prompt="$(cat <<PROMPT
+Two independent auditors reviewed this repository. Their findings are below.
+
+security-audit:
+$(cat "$iter/audit-sec.json")
+
+hostile-review:
+$(cat "$iter/audit-hostile.json")
+
+Merge them into one list:
+- Collapse findings that describe the same defect, even when worded very
+  differently. Set 'source' to "both" when they do.
+- Sort by severity: CRITICAL, HIGH, MEDIUM, LOW.
+- Assign each finding an id of exactly the form F-$(printf '%02d' "$n")-N,
+  where N counts up from 1 in the sorted order.
+- Preserve the strongest evidence from either auditor.
+PROMPT
+)"
+  ( cd "$AF_WORKTREE" && af_run_agent combine "$AF_MODEL_COMBINE" \
+      "$AF_BUDGET_COMBINE" ro "$AF_SCHEMA_FINDINGS" \
+      "$iter/findings.json" "$iter/combine.log" "$prompt" ) \
+    || af_die "combine failed" "$?"
+
+  bad="$(jq -r --arg p "F-$(printf '%02d' "$n")-" \
+    '[.findings[].id | select(startswith($p) | not)] | join(", ")' \
+    "$iter/findings.json")"
+  [ -z "$bad" ] || af_die "combine produced non-canonical ids: $bad" "$AF_EX_SCHEMA"
 }
 
 af_main() {
