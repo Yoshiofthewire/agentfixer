@@ -16,6 +16,25 @@ setup() {
   [ "$output" = "0.02" ]
 }
 
+@test "spend accumulates correctly under real concurrency" {
+  # Unlike "spend survives a subshell" above, nothing here waits between
+  # launches: all five af_run_agent calls are genuinely in flight together,
+  # appending to spend.txt with no serialization imposed by the test.
+  stub_claude probe '{}'
+  run bash -c "$SRC
+    ( af_run_agent probe opus 1 ro '{}' '$AF_TMP/o1.json' '$AF_TMP/o1.log' hi ) &
+    ( af_run_agent probe opus 1 ro '{}' '$AF_TMP/o2.json' '$AF_TMP/o2.log' hi ) &
+    ( af_run_agent probe opus 1 ro '{}' '$AF_TMP/o3.json' '$AF_TMP/o3.log' hi ) &
+    ( af_run_agent probe opus 1 ro '{}' '$AF_TMP/o4.json' '$AF_TMP/o4.log' hi ) &
+    ( af_run_agent probe opus 1 ro '{}' '$AF_TMP/o5.json' '$AF_TMP/o5.log' hi ) &
+    wait"
+  [ "$status" -eq 0 ]
+  # Five distinct lines: no interleaved/corrupted appends.
+  [ "$(wc -l < "$AF_TMP/run/spend.txt")" -eq 5 ]
+  run bash -c "$SRC af_total_spend"
+  [ "$output" = "0.05" ]
+}
+
 @test "spend is zero before any agent runs" {
   run bash -c "$SRC af_total_spend"
   [ "$output" = "0.00" ]

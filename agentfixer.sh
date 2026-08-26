@@ -59,7 +59,8 @@ af_init_display() {
 af_log() { printf '%s  %-5s %s\n' "$(date +%H:%M:%S)" "$1" "$2" >&2; }
 
 af_total_spend() {
-  awk '{t += $1} END {printf "%.2f\n", t}' "${AF_RUN_DIR:-.}/spend.txt" 2>/dev/null \
+  : "${AF_RUN_DIR:?internal error: agent invoked before af_setup_run}"
+  awk '{t += $1} END {printf "%.2f\n", t}' "$AF_RUN_DIR/spend.txt" 2>/dev/null \
     || printf '0.00\n'
 }
 
@@ -231,6 +232,7 @@ af_sandbox_prefix() {
 af_run_agent() {
   local step="$1" model="$2" budget="$3" mode="$4" schema="$5"
   local out="$6" log="$7" prompt="$8"
+  : "${AF_RUN_DIR:?internal error: agent invoked before af_setup_run}"
   local -a args=(
     --print --output-format json --no-session-persistence
     --model "$model" --max-budget-usd "$budget" --json-schema "$schema"
@@ -281,7 +283,7 @@ af_run_agent() {
   # Recorded in a file, not a variable: this function runs in background
   # subshells for the parallel audits and under the spinner, and a subshell's
   # variable assignments do not reach the parent.
-  jq -r '.total_cost_usd // 0' "$log" >> "${AF_RUN_DIR:-.}/spend.txt"
+  jq -r '.total_cost_usd // 0' "$log" >> "$AF_RUN_DIR/spend.txt"
 
   if jq -e '(.permission_denials | length) > 0' "$log" >/dev/null 2>&1; then
     af_log warn "step '$step' had tool denials; see $log"
@@ -337,6 +339,11 @@ SCHEMA
 AF_RUN_DIR="${AF_RUN_DIR:-}"
 AF_WORKTREE="${AF_WORKTREE:-}"
 AF_BRANCH="${AF_BRANCH:-}"
+# Set by af_run_repo, read by its EXIT trap. A `local` here would not do: a
+# set -e-triggered exit (as opposed to an explicit `exit` call) fires the
+# trap after the failing function's local scope has already been popped, so
+# a local var reads as unbound under set -u. A global survives that.
+AF_REPO_DIR="${AF_REPO_DIR:-}"
 AF_BASE_SHA="${AF_BASE_SHA:-}"
 
 af_setup_run() {
@@ -411,6 +418,13 @@ af_step_audit() {
 
 af_step_combine() {
   local iter="$1" n="$2" prompt bad
+  # A cat failure inside the nested $(...) below is swallowed by the outer
+  # command substitution: the prompt would silently go out half-empty
+  # instead of the step failing loudly. Check explicitly first.
+  [ -f "$iter/audit-sec.json" ] \
+    || af_die "combine: missing $iter/audit-sec.json (audit did not run)" "$AF_EX_USAGE"
+  [ -f "$iter/audit-hostile.json" ] \
+    || af_die "combine: missing $iter/audit-hostile.json (audit did not run)" "$AF_EX_USAGE"
   prompt="$(cat <<PROMPT
 Two independent auditors reviewed this repository. Their findings are below.
 
@@ -826,9 +840,100 @@ af_step_merge() {
         "$AF_EX_GATE"
 }
 
-af_usage() {
-  printf 'usage: agentfixer.sh [--no-sandbox] [--repo NAME] [--iterations N]\n'
+# ---------------------------------------------------------------- iteration
+AF_DRY_RUN="${AF_DRY_RUN:-0}"
+
+af_run_repo() {
+  local dir="$1" name="$2" iters="$3" base n iter nfind nconf
+  af_init_display
+  AF_REPO_LABEL="$name"
+
+  base="$(af_preflight "$dir")"
+  af_setup_run "$dir" "$name" "$base"
+  AF_REPO_DIR="$dir"
+  trap 'af_cleanup_worktree "$AF_REPO_DIR"' EXIT
+
+  for (( n = 1; n <= iters; n++ )); do
+    AF_ITER_LABEL="iteration $n/$iters"
+    iter="$(af_iter_dir "$n")"
+
+    af_status audit active "2 auditors"
+    af_with_spinner audit af_step_audit "$iter"
+    af_status audit "done" "sec $(jq '.findings|length' "$iter/audit-sec.json") · hostile $(jq '.findings|length' "$iter/audit-hostile.json")"
+
+    af_status combine active ""
+    af_with_spinner combine af_step_combine "$iter" "$n"
+    nfind="$(jq '.findings | length' "$iter/findings.json")"
+    af_status combine "done" "$nfind unique"
+
+    if [ "$nfind" -eq 0 ]; then
+      af_log info "$name is clean: no findings in iteration $n. Stopping."
+      break
+    fi
+
+    af_status verify active "$nfind claims"
+    af_with_spinner verify af_step_verify "$iter"
+    nconf="$(jq '[.verdicts[] | select(.confirmed)] | length' "$iter/verified.json")"
+    af_status verify "done" "$nconf confirmed · $(( nfind - nconf )) rejected"
+
+    if [ "$nconf" -eq 0 ]; then
+      af_log info "iteration $n: every finding was rejected by verification"
+      continue
+    fi
+
+    af_confirmed "$iter" > "$iter/confirmed.json"
+    af_set_blurb "$(cat "$iter/confirmed.json")"
+
+    if [ "$AF_DRY_RUN" = "1" ]; then
+      af_log info "dry run: would fix $nconf findings"
+      jq -r '.[] | "  \(.severity)  \(.file):\(.line)  \(.title)"' "$iter/confirmed.json"
+      break
+    fi
+
+    af_status fix active "$nconf findings · parallel subagents"
+    af_with_spinner fix af_step_fix "$iter"
+    af_commit_fixes "$iter" "$n"
+    af_status fix "done" "$nconf fixed"
+    AF_BLURB=""
+
+    af_status pr active ""
+    af_step_pr "$iter" "$n" "$iters" "$base"
+    af_status pr "done" "#$AF_PR_NUM"
+
+    af_status ci active "waiting"
+    af_ci_loop "$iter" "$AF_PR_NUM"
+    af_status ci "done" "green"
+
+    af_status merge active ""
+    af_step_merge "$AF_PR_NUM"
+    af_status merge "done" "squashed"
+
+    git -C "$dir" fetch --quiet origin
+    AF_BASE_SHA="$(git -C "$dir" rev-parse "origin/$base")"
+    git -C "$AF_WORKTREE" reset --hard --quiet "$AF_BASE_SHA"
+  done
+
+  af_log info "$name finished. spent \$$(af_total_spend)"
 }
+
+af_usage() {
+  cat <<'USAGE'
+usage: agentfixer.sh [options]
+
+  --repo NAME         repo in the workspace to run against; omit for a picker
+  --iterations N      how many audit/fix/merge cycles to run (default 1)
+  --workspace DIR     directory holding the repos (default: parent of this repo)
+  --base BRANCH       base branch (default: the remote HEAD)
+  --dry-run           audit and verify only; change nothing
+  --plain             line output instead of a live display
+  --no-sandbox        run write-mode agents unsandboxed (not recommended)
+  --yes, -y           skip the confirmation prompt
+  --version, -h
+USAGE
+}
+
+# Task 14 replaces this with an fzf-driven picker.
+af_interactive() { af_die "interactive mode not implemented yet" "$AF_EX_USAGE"; }
 
 af_main() {
   # Internal run state is computed by af_setup_run, never inherited. These four
@@ -836,16 +941,37 @@ af_main() {
   # AF_SANDBOX is reset too: ambient environment must not be able to disable
   # the sandbox without an explicit, logged --no-sandbox flag.
   AF_RUN_DIR=""; AF_WORKTREE=""; AF_BRANCH=""; AF_BASE_SHA=""; AF_SANDBOX=1
-  while [ "${1:-}" = "--no-sandbox" ]; do
-    AF_SANDBOX=0
-    af_sandbox_warn
-    shift
+  local repo="" iters=1 ws="" yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)       repo="${2:-}"; shift 2 ;;
+      --iterations) iters="${2:-}"; shift 2 ;;
+      --workspace)  ws="${2:-}"; shift 2 ;;
+      --base)       AF_BASE="${2:-}"; shift 2 ;;
+      --plain)      AF_PLAIN=1; shift ;;
+      --dry-run)    AF_DRY_RUN=1; shift ;;
+      --no-sandbox) AF_SANDBOX=0; af_sandbox_warn; shift ;;
+      --yes|-y)     yes=1; shift ;;
+      --version)    printf 'agentfixer %s\n' "$AF_VERSION"; return 0 ;;
+      -h|--help)    af_usage; return 0 ;;
+      *)            af_die "unknown option: $1" "$AF_EX_USAGE" ;;
+    esac
   done
-  case "${1:-}" in
-    --version) printf 'agentfixer %s\n' "$AF_VERSION"; return 0 ;;
-    -h|--help) af_usage; return 0 ;;
-    *) af_die "unknown option: ${1:-}" "$AF_EX_USAGE" ;;
+
+  case "$iters" in
+    ''|*[!0-9]*) af_die "--iterations must be a positive integer" "$AF_EX_USAGE" ;;
   esac
+  [ "$iters" -ge 1 ] || af_die "--iterations must be at least 1" "$AF_EX_USAGE"
+
+  [ -n "$ws" ] || ws="$(af_resolve_workspace)"
+
+  if [ -n "$repo" ]; then
+    [ -d "$ws/$repo/.git" ] || af_die "no git repo named '$repo' in $ws" "$AF_EX_USAGE"
+    af_run_repo "$ws/$repo" "$repo" "$iters"
+    return 0
+  fi
+
+  af_interactive "$ws" "$iters" "$yes"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

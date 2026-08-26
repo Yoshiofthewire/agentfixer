@@ -10,6 +10,12 @@ n=1
 if [ -f "$n_file" ]; then n=$(( $(cat "$n_file") + 1 )); fi
 printf '%s' "$n" > "$n_file"
 
+# Optional side effect (e.g. simulating a real GitHub action the fake gh
+# can't perform on its own, like deleting a remote branch on merge).
+if [ -f "$d/$key.sh" ]; then
+  bash "$d/$key.sh"
+fi
+
 # Body and exit code are independent: a test may stub only an exit code
 # (no body) to simulate a bare failure, e.g. `gh pr merge` refusing.
 for f in "$d/$key.$n" "$d/$key"; do

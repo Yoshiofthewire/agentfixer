@@ -46,6 +46,9 @@ stub_claude_side_effect() { printf '%s' "$2" > "$AF_STUB_DIR/claude/$1.sh"; }
 # stub_gh <key> <body>   key is e.g. pr_checks, api_repos
 stub_gh() { printf '%s' "$2" > "$AF_STUB_DIR/gh/$1"; }
 
+# stub_gh_side_effect <key> <bash source>  -- runs before the stubbed call returns
+stub_gh_side_effect() { printf '%s' "$2" > "$AF_STUB_DIR/gh/$1.sh"; }
+
 # stub_gh_seq <key> <n> <body>  -- response for the Nth call
 stub_gh_seq() { printf '%s' "$3" > "$AF_STUB_DIR/gh/$1.$2"; }
 

@@ -1,7 +1,7 @@
 setup() {
   load helpers
   setup_stub_env
-  SRC="source '$AF_SCRIPT';"
+  SRC="source '$AF_SCRIPT'; AF_RUN_DIR='$AF_TMP';"
   ITER="$AF_TMP/iter-01"
   mkdir -p "$ITER"
   export AF_WORKTREE="$AF_TMP/wt"
@@ -57,4 +57,15 @@ FIND='{"findings":[{"id":"a1","severity":"HIGH","file":"x.ts","line":1,"title":"
   stub_claude combine '{"findings":[{"id":"whatever","severity":"HIGH","file":"x.ts","line":1,"title":"t","blurb":"b","detail":"d","evidence":"e"}]}'
   run bash -c "$SRC af_step_combine '$ITER' 1"
   [ "$status" -eq 4 ]
+}
+
+# Without the guard, cat's failure on the missing file is swallowed inside
+# the nested command substitution that builds the prompt, and combine would
+# silently call the agent with an empty audit section instead of failing.
+@test "combine dies loudly when audit output is missing, without calling the agent" {
+  stub_claude combine "$FIND"
+  run bash -c "$SRC af_step_combine '$ITER' 1"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"audit-sec.json"* ]]
+  [ ! -f "$AF_STUB_DIR/claude/combine.args" ]
 }

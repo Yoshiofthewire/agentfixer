@@ -1,7 +1,7 @@
 setup() {
   load helpers
   setup_stub_env
-  SRC="source '$AF_SCRIPT';"
+  SRC="source '$AF_SCRIPT'; AF_RUN_DIR='$AF_TMP';"
   ITER="$AF_TMP/iter-01"
   mkdir -p "$ITER"
   export AF_WORKTREE="$AF_TMP/wt"
