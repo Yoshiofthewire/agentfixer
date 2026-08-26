@@ -927,7 +927,8 @@ usage: agentfixer.sh [options]
   --plain             line output instead of a live display
   --no-sandbox        run write-mode agents unsandboxed (not recommended)
   --yes, -y           skip the confirmation prompt
-  --version, -h
+  --version           print the version and exit
+  --help, -h          print this usage and exit
 USAGE
 }
 
