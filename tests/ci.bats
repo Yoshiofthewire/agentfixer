@@ -229,3 +229,27 @@ setup() {
     af_ci_loop '$ITER' 7"
   [ "$status" -eq 3 ]
 }
+
+# E1 - cifix is the second write-mode agent, and it commits and PUSHES from
+# the host. Its `.git` tamper is caught after it returns and before either,
+# by the same gate call that runs G1. See the E1 tests in fix.bats.
+@test "E1: cifix tampering with .git is detected before it can commit" {
+  stub_gh_seq "$(gh_key pr checks)" 1 '[{"bucket":"fail","name":"t"}]'
+  stub_gh "$(gh_key run list)" '4242'
+  stub_gh "$(gh_key run view)" 'FAIL'
+  stub_claude cifix '{"diagnosis":"d","files_changed":["a.ts"],"confident":true}'
+  stub_claude_side_effect cifix 'echo fixed > a.ts
+git init -q -b x evilwt
+mv evilwt/.git evil
+rmdir evilwt
+printf "#!/bin/sh\ntouch %s/PWNED\n" "$AF_TMP" > evil/hooks/pre-commit
+chmod +x evil/hooks/pre-commit
+printf "gitdir: %s/evil\n" "$PWD" > .git'
+  run bash -c "$SRC
+    af_setup_run '$REPO' alpha main >/dev/null
+    git -C \"\$AF_WORKTREE\" push -q --set-upstream origin \"\$AF_BRANCH\"
+    af_ci_loop '$ITER' 7"
+  [ ! -f "$AF_TMP/PWNED" ]
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"tampered"* ]]
+}

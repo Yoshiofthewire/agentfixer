@@ -243,10 +243,12 @@ af_sandbox_warn() {
 #     lives under $HOME behind the tmpfs; without this bind every git command
 #     inside the sandbox fails with "not a git repository", so the agent
 #     cannot run a test suite that shells out to git, read history, or diff
-#     its own work. Read-only is enough for all three and keeps the property
-#     that only bash ever writes git state. The whole repository history
-#     becomes readable inside the sandbox - it is the repository the agent is
-#     already editing.
+#     its own work. Read-only is enough for all three. The whole repository
+#     history becomes readable inside the sandbox - it is the repository the
+#     agent is already editing.
+#   - Does NOT make the .git POINTER FILE unwritable: it is in the worktree,
+#     which is the read-write bind. An agent can rewrite it to name a gitdir
+#     of its own. Host-side git therefore never reads it - see af_git.
 af_sandbox_prefix() {
   local -a gitdir=()
   if [ -n "${AF_GITDIR:-}" ]; then
@@ -388,6 +390,40 @@ AF_BASE_SHA="${AF_BASE_SHA:-}"
 # Hard-assigned, never from the environment: this path is bound into the
 # write-mode sandbox, so ambient state must not be able to choose it.
 AF_GITDIR=""
+# The worktree's own gitdir, and the exact bytes af_setup_run left in
+# $AF_WORKTREE/.git. Both are captured before any agent runs; see af_git.
+AF_WORKTREE_GITDIR=""
+AF_WORKTREE_DOTGIT=""
+
+# Host-side git against the run's worktree. Everything after a write-mode
+# agent - the gates' own `git status`, then add/commit/push/merge - runs
+# unsandboxed as the user, with $HOME, ~/.ssh and ~/.config/gh reachable.
+# $AF_WORKTREE/.git is only a pointer file ("gitdir: <path>") and it lives
+# inside the sandbox's read-write bind, so an agent can repoint it at a
+# gitdir of its own and have git here run that gitdir's hooks, and report
+# that gitdir's idea of what changed. Naming --git-dir and --work-tree
+# explicitly means git never consults the pointer file at all;
+# core.hooksPath=/dev/null means no hook of any provenance runs, since this
+# tool never legitimately needs the target repository's hooks to fire.
+af_git() {
+  git -C "$AF_WORKTREE" --git-dir "$AF_WORKTREE_GITDIR" \
+    --work-tree "$AF_WORKTREE" -c core.hooksPath=/dev/null "$@"
+}
+
+# Tampering with the pointer file is a hostile agent, not a bug. The pin
+# above already makes it inert; this stops the run rather than continuing to
+# host-side git commands - push, merge - on a worktree someone tried to
+# escape from. Not a pipeline and not in a subshell: af_die must reach the
+# caller.
+af_assert_worktree_git() {
+  local now="<missing or not a regular file>"
+  if [ -f "$AF_WORKTREE/.git" ]; then now="$(cat "$AF_WORKTREE/.git")"; fi
+  [ "$now" = "$AF_WORKTREE_DOTGIT" ] || af_die \
+    "$AF_WORKTREE/.git was tampered with by a write-mode agent.
+  expected: $AF_WORKTREE_DOTGIT
+  found:    $now
+Refusing to run any further git command against this worktree." "$AF_EX_GATE"
+}
 
 # Spec 5.5 and 10: agentfixer/<run>-iter<NN>. One branch per ITERATION, not
 # per run - a run whose merged branch is not deleted (deletion restricted, or
@@ -414,6 +450,13 @@ af_setup_run() {
   AF_BASE_SHA="$(git -C "$dir" rev-parse "origin/$base")"
   git -C "$dir" worktree add --quiet -b "$AF_BRANCH" "$AF_WORKTREE" "$AF_BASE_SHA" \
     || af_die "could not create worktree at $AF_WORKTREE"
+  # Resolved here, once, while the pointer file is still ours - never
+  # recomputed from it later. `git worktree add` picks the linked worktree's
+  # name from the path's basename but may disambiguate it, so ask git rather
+  # than assuming $AF_GITDIR/worktrees/worktree.
+  AF_WORKTREE_GITDIR="$(git -C "$AF_WORKTREE" rev-parse --path-format=absolute --git-dir)" \
+    || af_die "could not resolve the git directory of $AF_WORKTREE"
+  AF_WORKTREE_DOTGIT="$(cat "$AF_WORKTREE/.git")"
 }
 
 af_iter_dir() {
@@ -429,11 +472,11 @@ af_iter_dir() {
 af_cleanup_worktree() {
   local dir="$1"
   [ -n "$AF_WORKTREE" ] && [ -d "$AF_WORKTREE" ] || return 0
-  if [ -n "$(git -C "$AF_WORKTREE" status --porcelain)" ]; then
+  if [ -n "$(af_git status --porcelain)" ]; then
     af_log warn "worktree is dirty, leaving it: $AF_WORKTREE"
     return 0
   fi
-  if [ -n "$(git -C "$AF_WORKTREE" log --oneline "$AF_BASE_SHA..HEAD")" ]; then
+  if [ -n "$(af_git log --oneline "$AF_BASE_SHA..HEAD")" ]; then
     af_log warn "worktree has unmerged commits, leaving it: $AF_WORKTREE"
     return 0
   fi
@@ -601,7 +644,7 @@ $bad" "$AF_EX_GATE"
 # function - carries git's failure to the caller.
 af_changed_paths() {
   local rec status pending=0
-  git -C "$AF_WORKTREE" status --porcelain -z | while IFS= read -r -d '' rec; do
+  af_git status --porcelain -z | while IFS= read -r -d '' rec; do
     if [ "$pending" = 1 ]; then
       printf '%s\n' "$rec"
       pending=0
@@ -616,10 +659,15 @@ af_changed_paths() {
 }
 
 # G1's input producers fail closed: an unreadable path list is not "clean".
+# Called by both write-mode steps immediately after their agent returns, so
+# this is where the tamper check belongs: after the only thing that could
+# have tampered, and before anything acts on the result. Checked after the
+# producer, so a plain unreadable worktree still reports as G1.
 af_gate_changed_paths() {
   local paths
   paths="$(af_changed_paths)" \
     || af_die "G1: could not read the changed paths in $AF_WORKTREE" "$AF_EX_GATE"
+  af_assert_worktree_git
   af_gate_workflows "$paths"
 }
 
@@ -656,6 +704,7 @@ PROMPT
 
 af_commit_fixes() {
   local iter="$1" n="$2" body count msg
+  af_assert_worktree_git
   count="$(jq -r '[.results[] | select(.status == "fixed")] | length' "$iter/fixed.json")"
   # Every finding may come back "skipped" - schema-valid, passes G2, nothing
   # staged. That is a valid outcome, not a failure: let git's raw "nothing to
@@ -677,8 +726,8 @@ af_commit_fixes() {
   msg="$(printf 'fix: %s verified findings from agentfixer iteration %d\n\n%s\n\n%s' \
     "$count" "$n" "$body" "$AF_TRAILER")"
 
-  git -C "$AF_WORKTREE" add -A
-  git -C "$AF_WORKTREE" \
+  af_git add -A
+  af_git \
     -c user.name="agentfixer" -c user.email="noreply@anthropic.com" \
     commit -q -m "$msg"
 }
@@ -745,7 +794,7 @@ af_step_pr() {
   title="fix: $(jq -r '[.results[] | select(.status == "fixed")] | length' \
     "$iter/fixed.json") verified findings (agentfixer $n/$total)"
 
-  git -C "$AF_WORKTREE" push --quiet --set-upstream origin "$AF_BRANCH"
+  af_git push --quiet --set-upstream origin "$AF_BRANCH"
   af_ensure_labels
 
   AF_PR_URL="$(cd "$AF_WORKTREE" && gh pr create --repo "$AF_SLUG" \
@@ -863,16 +912,16 @@ PROMPT
   # git's raw "nothing to commit" (exit 1, this project's own usage/preflight
   # code) leak through here and it looks like a preflight bug in a cron log,
   # and worse, silently truncates the retry loop before AF_CI_RETRIES.
-  if [ -z "$(git -C "$AF_WORKTREE" status --porcelain)" ]; then
+  if [ -z "$(af_git status --porcelain)" ]; then
     af_log warn "cifix attempt $attempt made no changes; nothing to commit"
     return 0
   fi
-  git -C "$AF_WORKTREE" add -A
-  git -C "$AF_WORKTREE" \
+  af_git add -A
+  af_git \
     -c user.name="agentfixer" -c user.email="noreply@anthropic.com" \
     commit -q -m "$(printf 'fix: address CI failure (attempt %s)\n\n%s' \
       "$attempt" "$AF_TRAILER")"
-  git -C "$AF_WORKTREE" push --quiet origin "$AF_BRANCH"
+  af_git push --quiet origin "$AF_BRANCH"
 }
 
 af_ci_loop() {
@@ -926,7 +975,7 @@ Halting the run: a PR that cannot be made green means something systemic." \
 # gate-passing) path list.
 af_range_paths() {
   local status old new path
-  git -C "$AF_WORKTREE" diff --name-status -z "$1" | while IFS= read -r -d '' status; do
+  af_git diff --name-status -z "$1" | while IFS= read -r -d '' status; do
     case "$status" in
       R*|C*)
         IFS= read -r -d '' old
@@ -944,6 +993,10 @@ af_range_paths() {
 af_step_merge() {
   local pr="$1" state head paths
   af_require_slug
+  # `gh pr merge --delete-branch` runs its own git commands in $AF_WORKTREE,
+  # and those do discover the pointer file. Nothing but bash has touched the
+  # worktree since the last check; confirm that before handing it to gh.
+  af_assert_worktree_git
   state="$(af_check_state "$pr")"
   case "$state" in
     pass) : ;;
@@ -958,7 +1011,7 @@ Refusing to merge." "$AF_EX_GATE" ;;
     || af_die "G1: could not read the merge range $AF_BASE_SHA..HEAD" "$AF_EX_GATE"
   af_gate_workflows "$paths"
 
-  head="$(git -C "$AF_WORKTREE" rev-parse HEAD)"
+  head="$(af_git rev-parse HEAD)"
   ( cd "$AF_WORKTREE" && gh pr merge "$pr" --repo "$AF_SLUG" --squash --delete-branch \
       --match-head-commit "$head" ) \
     || af_die "G3: merge of PR #$pr was refused (head moved, or not mergeable)." \
@@ -987,7 +1040,7 @@ af_run_repo() {
     # this same base sha and holds nothing, and a branch that does hold
     # something is work this tool does not delete.
     af_set_iter_branch "$n"
-    git -C "$AF_WORKTREE" checkout -q -B "$AF_BRANCH" "$AF_BASE_SHA"
+    af_git checkout -q -B "$AF_BRANCH" "$AF_BASE_SHA"
 
     af_status audit active "2 auditors"
     af_with_spinner audit af_step_audit "$iter"
@@ -1050,7 +1103,7 @@ af_run_repo() {
 
     git -C "$dir" fetch --quiet origin
     AF_BASE_SHA="$(git -C "$dir" rev-parse "origin/$base")"
-    git -C "$AF_WORKTREE" reset --hard --quiet "$AF_BASE_SHA"
+    af_git reset --hard --quiet "$AF_BASE_SHA"
   done
 
   af_log info "$name finished. spent \$$(af_total_spend)"

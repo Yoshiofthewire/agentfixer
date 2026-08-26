@@ -125,8 +125,17 @@ and `/hostile-review`.
   git repository`, so the agent cannot run a test suite that shells out to
   git, read history, or diff its own work. That directory is therefore bound
   back in **read-only**: the agent can read the whole history and config of
-  the repo it is already editing, and can write neither. Nothing but bash
-  ever writes git state.
+  the repo it is already editing, and cannot write it.
+- **The pointer file itself is writable, and is not trusted.** `.git` sits in
+  the worktree, which is the one read-write bind, so a write-mode agent can
+  rewrite it to name a git directory of its own — one whose `hooks/pre-commit`
+  would then run *outside* the sandbox, as your user, when bash commits.
+  So bash does not read it: every host-side git command against the worktree
+  names `--git-dir` and `--work-tree` explicitly, resolved once before any
+  agent ran, and passes `core.hooksPath=/dev/null` so no hook of any
+  provenance fires. On top of that, the pointer file's contents are compared
+  against what setup wrote before each commit and before each merge; a
+  mismatch aborts the run with exit 3.
 - Read-only steps run with no sandbox at all, by design (see above).
 
 `$HOME` inside the sandbox is a writable but *empty* tmpfs, so toolchains

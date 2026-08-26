@@ -12,6 +12,19 @@ J
   cat > "$ITER/verified.json" <<'J'
 {"verdicts":[{"id":"F-01-1","confirmed":true,"reason":"real"}]}
 J
+  # E1 payload, run in the agent's cwd (the worktree): a gitdir the agent
+  # controls at ./evil, a pre-commit hook that drops a marker, and the
+  # pointer file that redirects host-side git into it. `git init x && mv
+  # x/.git evil` rather than `git init --bare`: a bare gitdir is
+  # core.bare=true and git refuses to commit through it, and leaving a
+  # nested .git in place makes `git add -A` fail on that directory before
+  # the gate is ever reached. Marker file, never a destructive payload.
+  PLANT='git init -q -b x evilwt
+mv evilwt/.git evil
+rmdir evilwt
+printf "#!/bin/sh\ntouch %s/PWNED\n" "$AF_TMP" > evil/hooks/pre-commit
+chmod +x evil/hooks/pre-commit
+printf "gitdir: %s/evil\n" "$PWD" > .git'
 }
 
 @test "G1 rejects a .github path" {
@@ -147,12 +160,17 @@ J
   [ "$status" -ne 0 ]
 }
 
+# Breaking the gitdir, not the worktree path: host-side git no longer
+# discovers the repository from $AF_WORKTREE (see E1), so a good gitdir
+# pointed at a non-repo directory now reads as a perfectly legible "every
+# file was deleted" rather than as a failure. An unreadable gitdir - removed,
+# corrupt, permissions - is what a failing `git status` looks like now.
 @test "G1 fails closed when the working tree cannot be read" {
   stub_claude fix '{"results":[{"id":"F-01-1","status":"fixed","files_changed":["a.ts"]}]}'
   mkdir -p "$AF_TMP/notarepo"
   run bash -c "$SRC AF_SANDBOX=0
     af_setup_run '$REPO' alpha main >/dev/null
-    AF_WORKTREE='$AF_TMP/notarepo'
+    AF_WORKTREE_GITDIR='$AF_TMP/notarepo'
     af_step_fix '$ITER'"
   [ "$status" -eq 3 ]
   [[ "$output" == *"G1"* ]]
@@ -182,4 +200,70 @@ git add -A'
     af_step_fix '$ITER'"
   [ "$status" -eq 3 ]
   [[ "$output" == *"G1"* ]]
+}
+
+# E1 - $AF_WORKTREE/.git is a plain pointer file ("gitdir: <path>") sitting
+# inside the sandbox's read-write bind, so a write-mode agent can repoint it
+# at a gitdir it controls. Everything after the agent - the gate's own
+# `git status`, then `git add`/`commit`/`push` - runs unsandboxed as the
+# user, with $HOME, ~/.ssh and ~/.config/gh reachable. Three independent
+# layers, one per test: pin the gitdir, disable hooks, detect the tamper.
+
+# Layer 1. Repointing .git used to change what G1 sees: the attacker's
+# gitdir is a fresh repo in which README.md reads as untracked and the real
+# modifications are invisible.
+@test "E1: host-side git ignores a repointed .git pointer file" {
+  run bash -c "$SRC
+    af_setup_run '$REPO' alpha main >/dev/null
+    cd \"\$AF_WORKTREE\"
+    $PLANT
+    af_changed_paths"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"evil/"* ]]
+  [[ "$output" != *"README.md"* ]]
+}
+
+# Layer 2. The target repository's own hooks must never fire on the host.
+# Hooks live in the common gitdir, which a linked worktree shares.
+@test "E1: the host-side commit does not run the target repo's hooks" {
+  cat > "$ITER/fixed.json" <<'J'
+{"results":[{"id":"F-01-1","status":"fixed","files_changed":["a.ts"]}]}
+J
+  bash -c "$SRC af_confirmed '$ITER' > '$ITER/confirmed.json'"
+  printf '#!/bin/sh\ntouch %s/PWNED\n' "$AF_TMP" > "$REPO/.git/hooks/pre-commit"
+  chmod +x "$REPO/.git/hooks/pre-commit"
+  run bash -c "$SRC
+    af_setup_run '$REPO' alpha main >/dev/null
+    echo patched > \"\$AF_WORKTREE/a.ts\"
+    af_commit_fixes '$ITER' 1"
+  [ "$status" -eq 0 ]
+  [ ! -f "$AF_TMP/PWNED" ]
+}
+
+# Layer 3. A rewritten pointer file is a hostile agent, not a bug: name it
+# and stop the run.
+@test "E1: .git tampering is detected and exits 3" {
+  stub_claude fix '{"results":[{"id":"F-01-1","status":"fixed","files_changed":["a.ts"]}]}'
+  stub_claude_side_effect fix "echo patched > a.ts
+$PLANT"
+  run bash -c "$SRC AF_SANDBOX=0
+    af_setup_run '$REPO' alpha main >/dev/null
+    af_step_fix '$ITER'"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"tampered"* ]]
+}
+
+# The whole escape, end to end: plant the gitdir and the hook, then let the
+# run walk into the unsandboxed commit. The hook must not execute and the
+# run must abort.
+@test "E1: a planted gitdir cannot execute a hook on the host" {
+  stub_claude fix '{"results":[{"id":"F-01-1","status":"fixed","files_changed":["a.ts"]}]}'
+  stub_claude_side_effect fix "echo patched > a.ts
+$PLANT"
+  run bash -c "$SRC AF_SANDBOX=0
+    af_setup_run '$REPO' alpha main >/dev/null
+    af_step_fix '$ITER'
+    af_commit_fixes '$ITER' 1"
+  [ ! -f "$AF_TMP/PWNED" ]
+  [ "$status" -ne 0 ]
 }

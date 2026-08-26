@@ -46,8 +46,9 @@ setup() {
   [[ "$output" == *"init"* ]]
 }
 
-# Read-only is sufficient for the agent to inspect history and run a suite,
-# and it preserves the property that only bash ever writes git state.
+# Read-only is sufficient for the agent to inspect history and run a suite.
+# It does NOT cover $AF_WORKTREE/.git, which is in the read-write bind: see
+# the E1 tests in fix.bats for what stops that pointer file being trusted.
 @test "CONFINEMENT: the repository gitdir is exposed read-only" {
   command -v bwrap >/dev/null || skip "bwrap not installed"
   local repo
