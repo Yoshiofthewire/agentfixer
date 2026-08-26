@@ -23,7 +23,9 @@ agentfixer resolves its own real path and, if that path is inside a git repo,
 treats that repo's *parent* directory as the workspace — the set of sibling
 repos it will offer to run against. The symlink above works because
 `~/git/agentfixer.sh` resolves to `~/git/agentfixer/agentfixer.sh`, whose
-repo's parent is `~/git`. It never lists itself as a target.
+repo's parent is `~/git`. It never lists itself as a target — the exclusion
+is the repo its own resolved path lives in, whatever that repo is called, so
+an unrelated repo that happens to be named `agentfixer` is still offered.
 
 Requires `claude`, `gh` (authenticated — `gh auth login`), `jq`, and `git`.
 `fzf` is required for the interactive repo picker; `tmux` is required only
@@ -195,6 +197,13 @@ Override the defaults with environment variables:
 | `AF_MODEL_AUDIT`, `AF_MODEL_COMBINE`, `AF_MODEL_VERIFY`, `AF_MODEL_FIX`, `AF_MODEL_CIFIX` | opus/sonnet/opus/opus/sonnet | model per step |
 | `AF_CACHE` | `~/.cache/agentfixer` | where worktrees and run logs live |
 | `AF_CI_TIMEOUT` | 1800 (seconds) | how long to wait for CI to settle |
+| `AF_BASE` | the remote HEAD | base branch, same as `--base` |
+
+`AF_BASE` is the one setting that is *also* a flag, and `--base` simply sets
+it. Unlike the run's internal state (worktree, branch, sandbox), `af_main`
+does not reset it, so an `AF_BASE` exported in your shell or crontab applies
+to every repo in the run — including ones whose default branch is something
+else. Prefer `--base` unless you mean exactly that.
 
 ## Development
 

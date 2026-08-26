@@ -28,12 +28,24 @@ af_resolve_workspace() {
   fi
 }
 
+# The repo this script itself lives in, by name. Derived, not hardcoded: the
+# install layout is a convention, and a repo named "agentfixer" that is not
+# this one is a legitimate target.
+af_self_repo_name() {
+  local real dir root
+  real="$(readlink -f "${BASH_SOURCE[0]}")"
+  dir="$(dirname "$real")"
+  root="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  basename "$root"
+}
+
 af_list_repos() {
-  local ws="$1" d
+  local ws="$1" d self
+  self="$(af_self_repo_name)" || self=""
   for d in "$ws"/*/; do
     [ -d "$d/.git" ] || continue
     d="$(basename "$d")"
-    [ "$d" = "agentfixer" ] && continue
+    if [ -n "$self" ] && [ "$d" = "$self" ]; then continue; fi
     printf '%s\n' "$d"
   done | sort
 }
@@ -120,14 +132,12 @@ af_render_tty() {
 af_with_spinner() {
   local step="$1"; shift
   "$@" & local pid=$!
-  local i=0
   while kill -0 "$pid" 2>/dev/null; do
     if [ "$AF_PLAIN" != "1" ]; then
       AF_SPIN_FRAMES="${AF_SPIN_FRAMES:1}${AF_SPIN_FRAMES:0:1}"
       af_render "$step"
     fi
     if [ "$AF_SPIN_POLL" -gt 0 ]; then sleep "$AF_SPIN_POLL"; else break; fi
-    i=$(( i + 1 ))
   done
   wait "$pid"
 }
@@ -151,8 +161,10 @@ af_repo_slug() {
 
 af_base_branch() {
   local ref
+  # Strip the full prefix, not ##*/: a default branch of release/2.0 is
+  # refs/remotes/origin/release/2.0, and ##*/ would leave "2.0".
   if ref="$(git -C "$1" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null)"; then
-    printf '%s\n' "${ref##*/}"
+    printf '%s\n' "${ref#refs/remotes/origin/}"
     return 0
   fi
   printf 'main\n'
@@ -1062,8 +1074,16 @@ USAGE
 }
 
 # -------------------------------------------------------------- interactive
+# Its own function so a test can drive the prompt without a pty.
+af_stdin_is_tty() { [ -t 0 ]; }
+
 af_pick_repos() {
   local ws="$1" repos sel
+  # Checked here, not in af_preflight: the picker runs before preflight, and a
+  # headless --repo run needs no fzf at all. Same shape as af_launch_tmux's
+  # tmux check.
+  command -v fzf >/dev/null \
+    || af_die "fzf is required for the interactive repo picker; install fzf, or name a repo with --repo" "$AF_EX_USAGE"
   repos="$(af_list_repos "$ws")"
   [ -n "$repos" ] || af_die "no git repos found in $ws" "$AF_EX_USAGE"
   sel="$(printf '%s\n' "$repos" | fzf --multi \
@@ -1175,13 +1195,16 @@ af_main() {
     return 0
   fi
 
-  if [ -t 0 ] && [ "$iters" = "1" ] && [ "$yes" = "0" ]; then
+  if af_stdin_is_tty && [ "$iters" = "1" ] && [ "$yes" = "0" ]; then
     printf 'iterations [1]: '
     read -r reply
     case "$reply" in
-      ''|*[!0-9]*) : ;;
+      ''|*[!0-9]*) : ;;   # empty or junk keeps the default
       *) iters="$reply" ;;
     esac
+    # "0" is numeric and would otherwise slip past the check above, giving a
+    # run that does nothing and exits 0.
+    [ "$iters" -ge 1 ] || af_die "iterations must be at least 1" "$AF_EX_USAGE"
   fi
 
   af_interactive "$ws" "$iters" "$yes"

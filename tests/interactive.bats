@@ -26,6 +26,43 @@ setup() {
   [ "$status" -eq 1 ]
 }
 
+# The picker is reached before af_preflight ever runs, so a missing fzf used
+# to surface as bash's own "fzf: command not found" and a set -e exit 127,
+# rather than this tool's own message and usage exit code. Same shape as
+# af_launch_tmux's existing tmux check. Host-independent PATH, for the reason
+# the "tmux is required" test below spells out.
+@test "a missing fzf is reported by name" {
+  mkdir -p "$AF_TMP/bin3"
+  local tool
+  for tool in basename sort readlink grep bash cat; do
+    ln -s "$(command -v "$tool")" "$AF_TMP/bin3/$tool"
+  done
+  run env PATH="$AF_TMP/bin3" bash -c "$SRC af_pick_repos '$AF_TMP/ws'"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"fzf is required"* ]]
+}
+
+# The prompt accepted 0, which bypassed af_main's own `-ge 1` check on
+# --iterations and produced a run that did nothing and exited 0.
+@test "the interactive iterations prompt rejects 0" {
+  run bash -c "$SRC
+    af_stdin_is_tty() { return 0; }
+    af_interactive() { echo DISPATCHED \"\$2\"; }
+    echo 0 | af_main --workspace '$AF_TMP/ws'"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"at least 1"* ]]
+  [[ "$output" != *"DISPATCHED"* ]]
+}
+
+@test "the interactive iterations prompt accepts a count" {
+  run bash -c "$SRC
+    af_stdin_is_tty() { return 0; }
+    af_interactive() { echo DISPATCHED \"\$2\"; }
+    echo 3 | af_main --workspace '$AF_TMP/ws'"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"DISPATCHED 3"* ]]
+}
+
 @test "confirmation states the repos, iterations and worst-case spend" {
   run bash -c "$SRC af_confirm 'alpha
 beta' 3 </dev/null"

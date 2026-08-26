@@ -18,6 +18,15 @@ setup() {
   [ "$output" = "test/alpha" ]
 }
 
+# ${ref##*/} on refs/remotes/origin/release/2.0 yields "2.0", which is not a
+# branch - the run would then die at "base branch origin/2.0 does not exist".
+@test "a default branch name containing a slash survives" {
+  git -C "$REPO" update-ref refs/remotes/origin/release/2.0 HEAD
+  git -C "$REPO" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/release/2.0
+  run bash -c "$SRC af_base_branch '$REPO'"
+  [ "$output" = "release/2.0" ]
+}
+
 @test "passes when the base branch is protected" {
   stub_gh "$(gh_key api repos/test/alpha/branches/main)" 'true'
   run bash -c "$SRC af_preflight '$REPO'"

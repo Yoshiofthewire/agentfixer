@@ -89,7 +89,6 @@ J
   # Per-call, not log-wide: no recorded call (labels or pr create) may lack --repo.
   run grep -vq -- '--repo test/alpha' "$AF_STUB_DIR/gh/calls.log"
   [ "$status" -eq 1 ]
-  git -C "$AF_TMP/remotes/alpha.git" rev-parse --verify "refs/heads/$(cd "$AF_TMP" && true; echo)" >/dev/null 2>&1 || true
   run bash -c "git -C '$AF_TMP/remotes/alpha.git' for-each-ref --format='%(refname)' refs/heads/"
   [[ "$output" == *"agentfixer/"* ]]
 }
