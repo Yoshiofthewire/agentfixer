@@ -577,6 +577,115 @@ af_step_pr() {
   [ -n "$AF_PR_NUM" ] || af_die "could not determine PR number from: $AF_PR_URL" "$AF_EX_SCHEMA"
 }
 
+# ------------------------------------------------------------------- ci
+AF_MODEL_CIFIX="${AF_MODEL_CIFIX:-sonnet}"
+AF_BUDGET_CIFIX="${AF_BUDGET_CIFIX:-3}"
+AF_CI_RETRIES="${AF_CI_RETRIES:-3}"
+AF_CI_TIMEOUT="${AF_CI_TIMEOUT:-1800}"
+AF_POLL="${AF_POLL:-15}"
+
+# shellcheck disable=SC2034
+read -r -d '' AF_SCHEMA_CIFIX <<'SCHEMA' || true
+{"type":"object","required":["diagnosis","files_changed","confident"],
+ "properties":{
+  "diagnosis":{"type":"string"},
+  "files_changed":{"type":"array","items":{"type":"string"}},
+  "confident":{"type":"boolean"}}}
+SCHEMA
+
+# An empty required-check set is "none", never "pass". Green with nothing to
+# be green about is not evidence.
+af_check_state() {
+  local json
+  json="$(gh pr checks "$1" --required --repo "$AF_SLUG" --json bucket,name 2>/dev/null || echo '[]')"
+  printf '%s' "$json" | jq -r '
+    if length == 0 then "none"
+    elif any(.[]; .bucket == "fail" or .bucket == "cancel") then "fail"
+    elif any(.[]; .bucket == "pending") then "pending"
+    else "pass" end'
+}
+
+af_wait_ci() {
+  local pr="$1" waited=0 state
+  while :; do
+    state="$(af_check_state "$pr")"
+    [ "$state" = "pending" ] || { printf '%s\n' "$state"; return 0; }
+    if [ "$waited" -ge "$AF_CI_TIMEOUT" ]; then printf 'timeout\n'; return 0; fi
+    if [ "$AF_POLL" -gt 0 ]; then
+      sleep "$AF_POLL"
+      waited=$(( waited + AF_POLL ))
+    else
+      waited=$(( waited + 1 ))   # tests set AF_POLL=0; still advance the clock
+    fi
+  done
+}
+
+af_step_cifix() {
+  local iter="$1" attempt="$2" pr="$3" logs prompt
+  logs="$(gh run view --repo "$AF_SLUG" --log-failed 2>/dev/null | tail -n 400 || true)"
+  prompt="$(cat <<PROMPT
+CI is failing on this branch. The tail of the failing jobs' logs:
+
+$logs
+
+Diagnose and fix the underlying cause in the source.
+
+Rules:
+- Never create or modify anything under .github/. The run aborts if you do.
+- Do not delete, skip, or weaken a test to make it pass. Fix the code.
+- Do not commit or push. The caller does that.
+PROMPT
+)"
+  ( cd "$AF_WORKTREE" && af_run_agent cifix "$AF_MODEL_CIFIX" \
+      "$AF_BUDGET_CIFIX" rw "$AF_SCHEMA_CIFIX" \
+      "$iter/cifix-$attempt.json" "$iter/cifix-$attempt.log" "$prompt" ) \
+    || af_die "cifix attempt $attempt failed" "$?"
+
+  af_gate_workflows "$(af_changed_paths)"
+  # A cifix attempt that makes no net change (or repeats a prior attempt's
+  # edit verbatim) leaves nothing to commit. Same as af_commit_fixes: let
+  # git's raw "nothing to commit" (exit 1, this project's own usage/preflight
+  # code) leak through here and it looks like a preflight bug in a cron log,
+  # and worse, silently truncates the retry loop before AF_CI_RETRIES.
+  if [ -z "$(git -C "$AF_WORKTREE" status --porcelain)" ]; then
+    af_log warn "cifix attempt $attempt made no changes; nothing to commit"
+    return 0
+  fi
+  git -C "$AF_WORKTREE" add -A
+  git -C "$AF_WORKTREE" \
+    -c user.name="agentfixer" -c user.email="noreply@anthropic.com" \
+    commit -q -m "$(printf 'fix: address CI failure (attempt %s)\n\n%s' \
+      "$attempt" "$AF_TRAILER")"
+  git -C "$AF_WORKTREE" push --quiet origin "$AF_BRANCH"
+}
+
+af_ci_loop() {
+  local iter="$1" pr="$2" attempt=0 state
+  while :; do
+    state="$(af_wait_ci "$pr")"
+    case "$state" in
+      pass) return 0 ;;
+      none)
+        gh pr edit "$pr" --repo "$AF_SLUG" --add-label needs-human >/dev/null 2>&1 || true
+        af_die "G3: PR #$pr has no required checks. Enable required status
+checks in branch protection. PR left open." "$AF_EX_GATE" ;;
+      timeout)
+        gh pr edit "$pr" --repo "$AF_SLUG" --add-label needs-human >/dev/null 2>&1 || true
+        af_die "CI did not settle within ${AF_CI_TIMEOUT}s. PR #$pr left open." \
+          "$AF_EX_CI" ;;
+    esac
+    attempt=$(( attempt + 1 ))
+    if [ "$attempt" -gt "$AF_CI_RETRIES" ]; then
+      gh pr edit "$pr" --repo "$AF_SLUG" --add-label needs-human >/dev/null 2>&1 || true
+      af_die "CI still failing after $AF_CI_RETRIES attempts. PR #$pr left open.
+Halting the run: a PR that cannot be made green means something systemic." \
+        "$AF_EX_CI"
+    fi
+    af_log info "CI failed, cifix attempt $attempt/$AF_CI_RETRIES"
+    af_step_cifix "$iter" "$attempt" "$pr"
+  done
+}
+
 af_usage() {
   printf 'usage: agentfixer.sh [--no-sandbox] [--repo NAME] [--iterations N]\n'
 }
