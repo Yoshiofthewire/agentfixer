@@ -574,7 +574,7 @@ af_step_pr() {
     --label agent-authored --label agentfixer)"
   AF_PR_NUM="${AF_PR_URL##*/}"
   printf '%s\n' "$AF_PR_URL" > "$iter/pr.txt"
-  [ -n "$AF_PR_NUM" ] || af_die "could not determine PR number from: $AF_PR_URL"
+  [ -n "$AF_PR_NUM" ] || af_die "could not determine PR number from: $AF_PR_URL" "$AF_EX_SCHEMA"
 }
 
 af_usage() {
