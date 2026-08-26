@@ -133,7 +133,10 @@ af_with_spinner() {
 }
 
 # ---------------------------------------------------------------- preflight
+# Hard-assigned, never `${AF_SLUG:-}`: ambient environment must not be able to
+# point this tool's gh calls at a repository the user did not name.
 AF_SLUG=""
+AF_BASE_BRANCH=""
 
 af_repo_slug() {
   local url
@@ -155,6 +158,10 @@ af_base_branch() {
   printf 'main\n'
 }
 
+# Results go to globals, NOT stdout: a `base="$(af_preflight ...)"` caller runs
+# this in a subshell, where the AF_SLUG assignment dies with it and every later
+# `gh --repo "$AF_SLUG"` falls back to git-remote discovery in the launch
+# directory - a different repository than the one being merged.
 af_preflight() {
   local dir="$1" slug base protected c
   for c in claude gh jq git; do
@@ -178,9 +185,16 @@ af_preflight() {
 agentfixer refuses to merge into an unprotected branch.
 Enable it at: https://github.com/$slug/settings/branches" "$AF_EX_USAGE"
   fi
-  # shellcheck disable=SC2034  # AF_SLUG is used by later pipeline steps (tasks 9-11)
   AF_SLUG="$slug"
-  printf '%s\n' "$base"
+  AF_BASE_BRANCH="$base"
+}
+
+# Every gh call in this tool passes --repo "$AF_SLUG". Real gh does not error
+# on an empty --repo: it silently falls back to the cwd's git remote. That is
+# the wrong repository at every call site that does not cd into the worktree,
+# so an unset slug must stop the run, not be papered over.
+af_require_slug() {
+  [ -n "$AF_SLUG" ] || af_die "internal error: AF_SLUG unset" "$AF_EX_USAGE"
 }
 
 # ------------------------------------------------------------------ sandbox
@@ -665,6 +679,7 @@ BODY
 
 af_step_pr() {
   local iter="$1" n="$2" total="$3" base="$4" title bodyfile
+  af_require_slug
   bodyfile="$iter/pr-body.md"
   af_pr_body "$iter" "$n" "$total" > "$bodyfile"
   title="fix: $(jq -r '[.results[] | select(.status == "fixed")] | length' \
@@ -702,6 +717,7 @@ SCHEMA
 # be green about is not evidence.
 af_check_state() {
   local json
+  af_require_slug
   json="$(gh pr checks "$1" --required --repo "$AF_SLUG" --json bucket,name 2>/dev/null || echo '[]')"
   printf '%s' "$json" | jq -r '
     if length == 0 then "none"
@@ -726,7 +742,8 @@ af_wait_ci() {
 }
 
 af_step_cifix() {
-  local iter="$1" attempt="$2" pr="$3" logs prompt
+  local iter="$1" attempt="$2" pr="$3" logs prompt run_id
+  af_require_slug
   logs="$(gh run view --repo "$AF_SLUG" --log-failed 2>/dev/null | tail -n 400 || true)"
   prompt="$(cat <<PROMPT
 CI is failing on this branch. The tail of the failing jobs' logs:
@@ -823,6 +840,7 @@ af_range_paths() {
 
 af_step_merge() {
   local pr="$1" state head
+  af_require_slug
   state="$(af_check_state "$pr")"
   case "$state" in
     pass) : ;;
@@ -847,7 +865,8 @@ af_run_repo() {
   af_init_display
   AF_REPO_LABEL="$name"
 
-  base="$(af_preflight "$dir")"
+  af_preflight "$dir"
+  base="$AF_BASE_BRANCH"
   af_setup_run "$dir" "$name" "$base"
   AF_REPO_DIR="$dir"
   trap 'af_cleanup_worktree "$AF_REPO_DIR"' EXIT

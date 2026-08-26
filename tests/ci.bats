@@ -16,6 +16,17 @@ setup() {
   [ "$output" = "none" ]
 }
 
+# C1 - an empty --repo is not an error to gh; it resolves the repository from
+# the cwd's git remote instead. Reading check state for the wrong repository is
+# how a green PR #N somewhere else could satisfy G3, so an unset slug must stop
+# the run before gh is ever invoked.
+@test "an unset slug is an internal error and reaches no gh call" {
+  run bash -c "source '$AF_SCRIPT'; AF_SLUG=''; af_check_state 7"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"AF_SLUG"* ]]
+  [ ! -f "$AF_STUB_DIR/gh/calls.log" ]
+}
+
 @test "all pass reads as pass" {
   stub_gh "$(gh_key pr checks)" '[{"bucket":"pass","name":"test"}]'
   run bash -c "$SRC af_check_state 7"

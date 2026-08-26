@@ -127,6 +127,19 @@ printf "{\"verdicts\":[{\"id\":\"%s\",\"confirmed\":false,\"reason\":\"no\"}]}" 
 # `shift` returns nonzero when asked to shift more than $#, and under set -e
 # that aborts the whole script right there - exit 1, but with no message at
 # all, unlike every other error path in af_main which goes through af_die.
+# C1 - unlike pr/merge/ci.bats, nothing here hand-sets AF_SLUG: af_run_repo must
+# get it from af_preflight. Every gh call must name the repo it means - either
+# `--repo test/alpha`, or an `api repos/test/alpha/...` path. `gh auth status`
+# is the one call that legitimately names no repo. Inverted grep, so a single
+# call missing the flag fails; a log-wide `grep -q` would not.
+@test "every gh call in a full run names the target repo" {
+  run bash -c "$SRC af_run_repo '$REPO' alpha 1"
+  [ "$status" -eq 0 ]
+  run grep -vE -- '(--repo test/alpha|^auth status$|^api repos/test/alpha/)' \
+    "$AF_STUB_DIR/gh/calls.log"
+  [ "$status" -eq 1 ]
+}
+
 @test "an option requiring a value as the final argument fails with a message" {
   local opt
   for opt in --repo --iterations --workspace --base; do

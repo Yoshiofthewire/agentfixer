@@ -24,6 +24,18 @@ setup() {
   [ "$status" -eq 0 ]
 }
 
+# C1 - af_preflight used to print the base branch on stdout, so af_run_repo
+# consumed it as `base="$(af_preflight "$dir")"`: a subshell, in which the
+# AF_SLUG assignment died. Every later `gh --repo "$AF_SLUG"` then ran with an
+# empty --repo, which real gh resolves from the launch directory's git remote.
+@test "preflight publishes the slug and base branch to the caller, not a subshell" {
+  stub_gh "$(gh_key api repos/test/alpha/branches/main)" 'true'
+  run bash -c "$SRC af_preflight '$REPO'; echo SLUG=\$AF_SLUG BASE=\$AF_BASE_BRANCH"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"SLUG=test/alpha"* ]]
+  [[ "$output" == *"BASE=main"* ]]
+}
+
 @test "fails when the base branch is unprotected" {
   stub_gh "$(gh_key api repos/test/alpha/branches/main)" 'false'
   run bash -c "$SRC af_preflight '$REPO'"
