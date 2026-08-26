@@ -121,3 +121,18 @@ printf "{\"verdicts\":[{\"id\":\"%s\",\"confirmed\":false,\"reason\":\"no\"}]}" 
   [ "$status" -eq 1 ]
   [[ "$output" == *"nosuchrepo"* ]]
 }
+
+# C6: --repo/--iterations/--workspace/--base as the final argument, with no
+# value following, used to hit `shift 2` with only one positional param left.
+# `shift` returns nonzero when asked to shift more than $#, and under set -e
+# that aborts the whole script right there - exit 1, but with no message at
+# all, unlike every other error path in af_main which goes through af_die.
+@test "an option requiring a value as the final argument fails with a message" {
+  local opt
+  for opt in --repo --iterations --workspace --base; do
+    run "$AF_SCRIPT" "$opt"
+    [ "$status" -eq 1 ]
+    [ -n "$output" ]
+    [[ "$output" == *"requires a value"* ]]
+  done
+}

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${AF_STUB_DIR:?}/tmux.log"
+# `has-session` succeeds only when the test says the session exists.
+if [ "${1:-}" = "has-session" ] && [ "${AF_STUB_TMUX_HAS:-0}" != "1" ]; then
+  exit 1
+fi
+exit 0

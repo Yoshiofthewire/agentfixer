@@ -35,6 +35,17 @@ setup() {
   [ "$output" = "0.05" ]
 }
 
+# C5: the `:?` guard belongs only on the write path (af_run_agent). On the
+# read path it was a landmine for af_render_tty, which calls af_total_spend
+# to draw the "spent:" line and can run before af_setup_run has ever set
+# AF_RUN_DIR (e.g. an interactive flow that renders a status before a repo
+# is chosen). Prove the read path tolerates AF_RUN_DIR entirely unset.
+@test "spend is tolerant of AF_RUN_DIR never having been set (read path)" {
+  run bash -c "source '$AF_SCRIPT'; AF_PLAIN=1; af_total_spend"
+  [ "$status" -eq 0 ]
+  [ "$output" = "0.00" ]
+}
+
 @test "spend is zero before any agent runs" {
   run bash -c "$SRC af_total_spend"
   [ "$output" = "0.00" ]

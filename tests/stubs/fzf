@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Stub fzf: echoes whatever $AF_STUB_FZF says, ignoring stdin.
+set -euo pipefail
+cat >/dev/null
+printf '%s\n' "${AF_STUB_FZF:-}"

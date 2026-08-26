@@ -59,7 +59,6 @@ af_init_display() {
 af_log() { printf '%s  %-5s %s\n' "$(date +%H:%M:%S)" "$1" "$2" >&2; }
 
 af_total_spend() {
-  : "${AF_RUN_DIR:?internal error: agent invoked before af_setup_run}"
   awk '{t += $1} END {printf "%.2f\n", t}' "$AF_RUN_DIR/spend.txt" 2>/dev/null \
     || printf '0.00\n'
 }
@@ -932,22 +931,92 @@ usage: agentfixer.sh [options]
 USAGE
 }
 
-# Task 14 replaces this with an fzf-driven picker.
-af_interactive() { af_die "interactive mode not implemented yet" "$AF_EX_USAGE"; }
+# -------------------------------------------------------------- interactive
+af_pick_repos() {
+  local ws="$1" repos sel
+  repos="$(af_list_repos "$ws")"
+  [ -n "$repos" ] || af_die "no git repos found in $ws" "$AF_EX_USAGE"
+  sel="$(printf '%s\n' "$repos" | fzf --multi \
+    --prompt 'repos > ' --header 'TAB to select multiple, ENTER to confirm')"
+  [ -n "$sel" ] || af_die "nothing selected" "$AF_EX_USAGE"
+  printf '%s\n' "$sel"
+}
+
+# Worst case per iteration, from the budget caps: both audits, combine,
+# verify, fix, and every permitted cifix retry.
+af_worst_case() {
+  awk -v a="$AF_BUDGET_AUDIT" -v c="$AF_BUDGET_COMBINE" -v v="$AF_BUDGET_VERIFY" \
+      -v f="$AF_BUDGET_FIX" -v x="$AF_BUDGET_CIFIX" -v r="$AF_CI_RETRIES" \
+      -v n="$1" -v i="$2" \
+      'BEGIN { printf "%.2f", n * i * (2*a + c + v + f + r*x) }'
+}
+
+af_confirm() {
+  local repos="$1" iters="$2" count reply
+  count="$(printf '%s\n' "$repos" | grep -c '')"
+  printf '\n  repos:      %s\n' "$(printf '%s' "$repos" | tr '\n' ' ')"
+  printf '  iterations: %s each\n' "$iters"
+  printf '  worst case: $%s (budget caps, not an estimate)\n' \
+    "$(af_worst_case "$count" "$iters")"
+  printf '\n  Agents will open and merge PRs in these repos. Continue? [y/N] '
+  read -r reply
+  case "$reply" in
+    y|Y) return 0 ;;
+    *) af_die "cancelled" "$AF_EX_USAGE" ;;
+  esac
+}
+
+af_launch_tmux() {
+  local iters="$1"; shift
+  local self repo first=1 cmd
+  self="$(readlink -f "${BASH_SOURCE[0]}")"
+  command -v tmux >/dev/null || af_die "tmux is required for a multi-repo run" "$AF_EX_USAGE"
+
+  for repo in "$@"; do
+    cmd="$self --repo $repo --iterations $iters --yes"
+    if [ -n "${TMUX:-}" ]; then
+      tmux new-window -n "$repo" "$cmd"
+    elif [ "$first" = "1" ]; then
+      tmux new-session -d -s agentfixer -n "$repo" "$cmd"
+      first=0
+    else
+      tmux new-window -t agentfixer -n "$repo" "$cmd"
+    fi
+  done
+  [ -n "${TMUX:-}" ] || tmux attach-session -t agentfixer
+}
+
+af_interactive() {
+  local ws="$1" iters="$2" yes="$3" sel count
+  sel="$(af_pick_repos "$ws")"
+  [ "$yes" = "1" ] || af_confirm "$sel" "$iters"
+  count="$(printf '%s\n' "$sel" | grep -c '')"
+  if [ "$count" -eq 1 ]; then
+    af_run_repo "$ws/$sel" "$sel" "$iters"
+  else
+    # shellcheck disable=SC2086
+    af_launch_tmux "$iters" $sel
+  fi
+}
 
 af_main() {
   # Internal run state is computed by af_setup_run, never inherited. These four
   # gate `git worktree remove --force` and, later, write-mode agent access.
   # AF_SANDBOX is reset too: ambient environment must not be able to disable
   # the sandbox without an explicit, logged --no-sandbox flag.
-  AF_RUN_DIR=""; AF_WORKTREE=""; AF_BRANCH=""; AF_BASE_SHA=""; AF_SANDBOX=1
-  local repo="" iters=1 ws="" yes=0
+  AF_RUN_DIR=""; AF_WORKTREE=""; AF_BRANCH=""; AF_BASE_SHA=""; AF_REPO_DIR=""
+  AF_SANDBOX=1
+  local repo="" iters=1 ws="" yes=0 reply
   while [ $# -gt 0 ]; do
     case "$1" in
-      --repo)       repo="${2:-}"; shift 2 ;;
-      --iterations) iters="${2:-}"; shift 2 ;;
-      --workspace)  ws="${2:-}"; shift 2 ;;
-      --base)       AF_BASE="${2:-}"; shift 2 ;;
+      --repo)       [ $# -ge 2 ] || af_die "--repo requires a value" "$AF_EX_USAGE"
+                    repo="$2"; shift 2 ;;
+      --iterations) [ $# -ge 2 ] || af_die "--iterations requires a value" "$AF_EX_USAGE"
+                    iters="$2"; shift 2 ;;
+      --workspace)  [ $# -ge 2 ] || af_die "--workspace requires a value" "$AF_EX_USAGE"
+                    ws="$2"; shift 2 ;;
+      --base)       [ $# -ge 2 ] || af_die "--base requires a value" "$AF_EX_USAGE"
+                    AF_BASE="$2"; shift 2 ;;
       --plain)      AF_PLAIN=1; shift ;;
       --dry-run)    AF_DRY_RUN=1; shift ;;
       --no-sandbox) AF_SANDBOX=0; af_sandbox_warn; shift ;;
@@ -969,6 +1038,15 @@ af_main() {
     [ -d "$ws/$repo/.git" ] || af_die "no git repo named '$repo' in $ws" "$AF_EX_USAGE"
     af_run_repo "$ws/$repo" "$repo" "$iters"
     return 0
+  fi
+
+  if [ -t 0 ] && [ "$iters" = "1" ] && [ "$yes" = "0" ]; then
+    printf 'iterations [1]: '
+    read -r reply
+    case "$reply" in
+      ''|*[!0-9]*) : ;;
+      *) iters="$reply" ;;
+    esac
   fi
 
   af_interactive "$ws" "$iters" "$yes"

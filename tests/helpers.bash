@@ -10,7 +10,9 @@ setup_stub_env() {
   mkdir -p "$AF_STUB_DIR/claude" "$AF_STUB_DIR/gh" "$AF_TMP/bin"
   cp "$AF_ROOT/tests/stubs/claude" "$AF_TMP/bin/claude"
   cp "$AF_ROOT/tests/stubs/gh" "$AF_TMP/bin/gh"
-  chmod +x "$AF_TMP/bin/claude" "$AF_TMP/bin/gh"
+  cp "$AF_ROOT/tests/stubs/fzf" "$AF_TMP/bin/fzf"
+  cp "$AF_ROOT/tests/stubs/tmux" "$AF_TMP/bin/tmux"
+  chmod +x "$AF_TMP/bin/claude" "$AF_TMP/bin/gh" "$AF_TMP/bin/fzf" "$AF_TMP/bin/tmux"
   export PATH="$AF_TMP/bin:$PATH"
   export HOME="$AF_TMP/home"
   mkdir -p "$HOME"
@@ -53,6 +55,8 @@ stub_gh_side_effect() { printf '%s' "$2" > "$AF_STUB_DIR/gh/$1.sh"; }
 stub_gh_seq() { printf '%s' "$3" > "$AF_STUB_DIR/gh/$1.$2"; }
 
 gh_calls() { cat "$AF_STUB_DIR/gh/calls.log" 2>/dev/null || true; }
+
+tmux_calls() { cat "$AF_STUB_DIR/tmux.log" 2>/dev/null || true; }
 
 # gh_key <arg1> <arg2> -- mirrors the sanitizing in tests/stubs/gh
 gh_key() { printf '%s_%s' "${1:-}" "${2:-}" | tr -c 'a-zA-Z0-9' '_'; }
