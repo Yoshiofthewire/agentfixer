@@ -133,3 +133,52 @@ setup() {
   [ "$status" -eq 0 ]
   grep -q 'pr merge 7' "$AF_STUB_DIR/gh/calls.log"
 }
+
+# Finding 1 (post-review) - `git diff --name-only -z` emits only the
+# resulting path for a rename; the old path is silently dropped. A commit
+# in the merge range that renames a required workflow OUT of
+# .github/workflows/ (disabling it) produces a path list with no
+# .github-prefixed entry at all, and the gate never trips. af_changed_paths
+# already handles this for the working-tree path (R/C emits both old and
+# new paths, from `git status --porcelain -z`); af_range_paths needs the
+# same rename-awareness for the committed-range path, from
+# `git diff --name-status -z`.
+
+@test "G1 over the commit range catches a rename OUT of .github/workflows" {
+  mkdir -p "$REPO/.github/workflows"
+  echo ci > "$REPO/.github/workflows/ci.yml"
+  git -C "$REPO" add -A
+  git -C "$REPO" commit -qm "add workflow"
+  git -C "$REPO" push -q origin main
+  stub_gh "$(gh_key pr checks)" '[{"bucket":"pass","name":"t"}]'
+  run bash -c "$SRC
+    af_setup_run '$REPO' alpha main >/dev/null
+    git -C \"\$AF_WORKTREE\" mv .github/workflows/ci.yml ci_moved.yml
+    git -C \"\$AF_WORKTREE\" -c user.email=t@t -c user.name=t commit -qm sneak
+    af_step_merge 7"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"G1"* ]]
+  ! grep -q 'pr merge' "$AF_STUB_DIR/gh/calls.log"
+}
+
+# The mirror case: a rename INTO .github/workflows already carries the new
+# (in-scope) path through --name-only, since that is always the resulting
+# path shown for a rename - so this one is not a bypass under either
+# implementation. Kept as a regression guard: if the rename-aware collector
+# below ever stopped emitting the new path, this would catch it.
+@test "G1 over the commit range catches a rename INTO .github/workflows" {
+  echo x > "$REPO/plain.yml"
+  git -C "$REPO" add -A
+  git -C "$REPO" commit -qm "add plain"
+  git -C "$REPO" push -q origin main
+  stub_gh "$(gh_key pr checks)" '[{"bucket":"pass","name":"t"}]'
+  run bash -c "$SRC
+    af_setup_run '$REPO' alpha main >/dev/null
+    mkdir -p \"\$AF_WORKTREE/.github/workflows\"
+    git -C \"\$AF_WORKTREE\" mv plain.yml .github/workflows/plain.yml
+    git -C \"\$AF_WORKTREE\" -c user.email=t@t -c user.name=t commit -qm sneak
+    af_step_merge 7"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"G1"* ]]
+  ! grep -q 'pr merge' "$AF_STUB_DIR/gh/calls.log"
+}

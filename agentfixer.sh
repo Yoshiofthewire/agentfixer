@@ -687,18 +687,33 @@ Halting the run: a PR that cannot be made green means something systemic." \
 }
 
 # -------------------------------------------------------------------- merge
-# -z is NUL-delimited and never quotes/escapes paths, unlike plain
-# --name-only: a path containing a double quote, backslash, or non-ASCII
-# byte is otherwise rewritten with the whole entry wrapped in quotes (e.g.
+# --name-status, not --name-only: --name-only prints only the resulting path
+# of a rename, silently dropping the old one. A commit that renames a
+# required workflow OUT of .github/workflows/ (disabling it) would then
+# produce no .github-prefixed entry at all and the gate would never trip.
+# -z is NUL-delimited and never quotes/escapes paths, unlike the default
+# format: a path containing a double quote, backslash, or non-ASCII byte is
+# otherwise rewritten with the whole entry wrapped in quotes (e.g.
 # `".github/workflows/ci \"x\".yml"`), which no longer starts with
-# `.github` and silently defeats af_gate_workflows's prefix match. Same
-# hazard af_changed_paths already hardens for the working-tree path; this
-# is the committed-range counterpart used just before merge.
+# `.github` and also defeats the prefix match. Same two hazards
+# af_changed_paths already hardens for the working-tree path (rename/copy
+# awareness and -z); this is the committed-range counterpart used just
+# before merge, so it must emit both old and new paths for R/C records.
 af_range_paths() {
-  local rec
-  while IFS= read -r -d '' rec; do
-    printf '%s\n' "$rec"
-  done < <(git -C "$AF_WORKTREE" diff --name-only -z "$1")
+  local status old new path
+  while IFS= read -r -d '' status; do
+    case "$status" in
+      R*|C*)
+        IFS= read -r -d '' old
+        IFS= read -r -d '' new
+        printf '%s\n%s\n' "$old" "$new"
+        ;;
+      *)
+        IFS= read -r -d '' path
+        printf '%s\n' "$path"
+        ;;
+    esac
+  done < <(git -C "$AF_WORKTREE" diff --name-status -z "$1")
 }
 
 af_step_merge() {
