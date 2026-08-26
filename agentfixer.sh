@@ -287,6 +287,9 @@ PROMPT
 }
 
 af_main() {
+  # Internal run state is computed by af_setup_run, never inherited. These four
+  # gate `git worktree remove --force` and, later, write-mode agent access.
+  AF_RUN_DIR=""; AF_WORKTREE=""; AF_BRANCH=""; AF_BASE_SHA=""
   case "${1:-}" in
     --version) printf 'agentfixer %s\n' "$AF_VERSION"; return 0 ;;
     -h|--help) printf 'usage: agentfixer.sh [--repo NAME] [--iterations N]\n'; return 0 ;;
