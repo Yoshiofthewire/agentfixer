@@ -41,6 +41,57 @@ af_list_repos() {
 
 af_log() { printf '[%s] %s\n' "$1" "$2" >&2; }
 
+# ---------------------------------------------------------------- preflight
+AF_SLUG=""
+
+af_repo_slug() {
+  local url
+  url="$(git -C "$1" remote get-url origin 2>/dev/null)" || return 1
+  url="${url%.git}"
+  case "$url" in
+    git@github.com:*) printf '%s\n' "${url#git@github.com:}" ;;
+    https://github.com/*) printf '%s\n' "${url#https://github.com/}" ;;
+    *) return 1 ;;
+  esac
+}
+
+af_base_branch() {
+  local ref
+  if ref="$(git -C "$1" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null)"; then
+    printf '%s\n' "${ref##*/}"
+    return 0
+  fi
+  printf 'main\n'
+}
+
+af_preflight() {
+  local dir="$1" slug base protected c
+  for c in claude gh jq git; do
+    command -v "$c" >/dev/null || af_die "missing dependency: $c" "$AF_EX_USAGE"
+  done
+  gh auth status >/dev/null 2>&1 || af_die "gh is not authenticated; run: gh auth login" "$AF_EX_USAGE"
+
+  slug="$(af_repo_slug "$dir")" \
+    || af_die "$dir has no github.com origin remote" "$AF_EX_USAGE"
+
+  git -C "$dir" fetch --quiet origin \
+    || af_die "$slug: git fetch origin failed" "$AF_EX_USAGE"
+
+  base="${AF_BASE:-$(af_base_branch "$dir")}"
+  git -C "$dir" rev-parse --verify --quiet "origin/$base" >/dev/null \
+    || af_die "$slug: base branch origin/$base does not exist" "$AF_EX_USAGE"
+
+  protected="$(gh api "repos/$slug/branches/$base" --jq '.protected' 2>/dev/null || echo false)"
+  if [ "$protected" != "true" ]; then
+    af_die "$slug: branch protection is not enabled on '$base'.
+agentfixer refuses to merge into an unprotected branch.
+Enable it at: https://github.com/$slug/settings/branches" "$AF_EX_USAGE"
+  fi
+  # shellcheck disable=SC2034  # AF_SLUG is used by later pipeline steps (tasks 9-11)
+  AF_SLUG="$slug"
+  printf '%s\n' "$base"
+}
+
 # ------------------------------------------------------------ agent wrapper
 AF_SPEND="0"
 
