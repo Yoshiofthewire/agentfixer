@@ -968,39 +968,44 @@ af_confirm() {
 
 af_launch_tmux() {
   local iters="$1"; shift
-  local self repo first=1 cmd
+  local self repo first=1
   self="$(readlink -f "${BASH_SOURCE[0]}")"
   command -v tmux >/dev/null || af_die "tmux is required for a multi-repo run" "$AF_EX_USAGE"
 
+  # `--` then argv, never a joined string: tmux's shell-command form runs a
+  # single string through `sh -c`, which would let a repo directory name
+  # containing shell metacharacters (e.g. `; rm -rf ~#`) execute arbitrary
+  # commands. Passed as distinct arguments after `--`, tmux execs directly
+  # with no shell in between - $repo can only ever land in argv, never in
+  # anything a shell parses.
   for repo in "$@"; do
-    cmd="$self --repo $repo --iterations $iters --yes"
     if [ -n "${TMUX:-}" ]; then
-      tmux new-window -n "$repo" "$cmd"
+      tmux new-window -n "$repo" -- "$self" --repo "$repo" --iterations "$iters" --yes
     elif [ "$first" = "1" ]; then
-      tmux new-session -d -s agentfixer -n "$repo" "$cmd"
+      tmux new-session -d -s agentfixer -n "$repo" -- "$self" --repo "$repo" --iterations "$iters" --yes
       first=0
     else
-      tmux new-window -t agentfixer -n "$repo" "$cmd"
+      tmux new-window -t agentfixer -n "$repo" -- "$self" --repo "$repo" --iterations "$iters" --yes
     fi
   done
   [ -n "${TMUX:-}" ] || tmux attach-session -t agentfixer
 }
 
 af_interactive() {
-  local ws="$1" iters="$2" yes="$3" sel count
+  local ws="$1" iters="$2" yes="$3" sel
+  local -a repos
   sel="$(af_pick_repos "$ws")"
   [ "$yes" = "1" ] || af_confirm "$sel" "$iters"
-  count="$(printf '%s\n' "$sel" | grep -c '')"
-  if [ "$count" -eq 1 ]; then
-    af_run_repo "$ws/$sel" "$sel" "$iters"
+  mapfile -t repos <<< "$sel"
+  if [ "${#repos[@]}" -eq 1 ]; then
+    af_run_repo "$ws/${repos[0]}" "${repos[0]}" "$iters"
   else
-    # shellcheck disable=SC2086
-    af_launch_tmux "$iters" $sel
+    af_launch_tmux "$iters" "${repos[@]}"
   fi
 }
 
 af_main() {
-  # Internal run state is computed by af_setup_run, never inherited. These four
+  # Internal run state is computed by af_setup_run, never inherited. These five
   # gate `git worktree remove --force` and, later, write-mode agent access.
   # AF_SANDBOX is reset too: ambient environment must not be able to disable
   # the sandbox without an explicit, logged --no-sandbox flag.
