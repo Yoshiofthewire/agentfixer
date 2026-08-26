@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Programmable `claude` stub. Dispatches on $AF_STEP.
+set -euo pipefail
+step="${AF_STEP:-unknown}"
+d="${AF_STUB_DIR:?AF_STUB_DIR unset}/claude"
+printf '%s\n' "$*" >> "$d/$step.args"
+
+# Optional side effect, executed in the caller's cwd (the worktree).
+if [ -f "$d/$step.sh" ]; then
+  bash "$d/$step.sh"
+fi
+
+rc=0
+if [ -f "$d/$step.exit" ]; then rc="$(cat "$d/$step.exit")"; fi
+
+# A raw envelope overrides everything, so tests can inject malformed output.
+if [ -f "$d/$step.envelope" ]; then
+  cat "$d/$step.envelope"
+  exit "$rc"
+fi
+
+payload='{}'
+if [ -f "$d/$step.json" ]; then payload="$(cat "$d/$step.json")"; fi
+jq -n --argjson so "$payload" '{
+  is_error: false, subtype: "success", api_error_status: null,
+  total_cost_usd: 0.01, permission_denials: [],
+  subagent_stats: {spawned: 1, completed: 1, failed: 0},
+  result: ($so | tostring), structured_output: $so
+}'
+exit "$rc"
