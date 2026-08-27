@@ -14,6 +14,8 @@ readonly AF_EX_GATE=3
 readonly AF_EX_SCHEMA=4
 # shellcheck disable=SC2034
 readonly AF_EX_BUDGET=5
+# shellcheck disable=SC2034
+readonly AF_EX_UPSTREAM=6
 
 af_die() { printf 'agentfixer: %s\n' "$1" >&2; exit "${2:-$AF_EX_USAGE}"; }
 
@@ -412,6 +414,20 @@ af_run_agent() {
     spend="$(jq -r '.total_cost_usd // "?"' "$log")"
     af_die "step '$step': budget exhausted - spent \$$spend of the \$$budget cap. Raise it with $(af_budget_var "$step")=<dollars>, or remove all per-step caps with --no-budget (or AF_BUDGET=off) if you're on a Claude subscription, where this dollar figure is notional rather than billed spend." "$AF_EX_BUDGET"
   fi
+  # An upstream API failure - rate limit, session limit, 5xx - is not
+  # malformed output either, and for the same reason budget exhaustion is
+  # not: nothing about agentfixer's contract was violated, the call simply
+  # could not complete. The envelope carries a non-null api_error_status and
+  # puts the human-readable cause in .result (observed on two live runs that
+  # died mid-review-loop: status 429, "You've hit your session limit").
+  # Checked before $rc so it wins whatever exit code claude chose.
+  if jq -e '.api_error_status != null' "$log" >/dev/null 2>&1; then
+    local api_status api_msg
+    api_status="$(jq -r '.api_error_status' "$log")"
+    api_msg="$(jq -r '.result // "no detail given"' "$log")"
+    af_die "step '$step': the Claude API returned $api_status - $api_msg
+Nothing agentfixer or this repository produced was rejected; the upstream call could not complete, so the run stopped where it stood. Any committed work is still in $AF_WORKTREE. Re-run when the limit clears." "$AF_EX_UPSTREAM"
+  fi
   if [ "$rc" -ne 0 ]; then
     af_die "step '$step': claude exited $rc (see $log)" "$AF_EX_SCHEMA"
   fi
@@ -787,6 +803,11 @@ af_gate_changed_paths() {
     || af_die "G1: could not read the changed paths in $AF_WORKTREE" "$AF_EX_GATE"
   af_assert_worktree_git
   af_gate_workflows "$paths"
+  # Optional: record the gated path list where a caller can read it (the
+  # review loop's carry-forward scope). Written only once the gates pass.
+  if [ $# -ge 1 ]; then
+    { [ -z "$paths" ] || printf '%s\n' "$paths"; } > "$1"
+  fi
 }
 
 af_step_fix() {
@@ -874,7 +895,11 @@ AF_BUDGET_REVIEW="${AF_BUDGET_REVIEW:-3}"
 AF_REVIEW_ROUNDS="${AF_REVIEW_ROUNDS:-3}"
 
 af_prompt_review() {
-  local iter="$1" diff="$2"
+  local iter="$1" diff="$2" scope="$3" carried
+  # The ids this round is NOT asking about, named so the reviewer knows they
+  # were settled rather than forgotten.
+  carried="$(jq -r -n --slurpfile c "$iter/confirmed.json" --argjson s "$scope" '
+    [ $c[0][].id | select(. as $i | all($s[]; . != $i)) ] | join(", ")')"
   cat <<PROMPT
 An agent was given the findings below and told to fix them. It produced the
 diff below. You did not make these changes, you did not choose this approach,
@@ -886,41 +911,154 @@ $(cat "$iter/confirmed.json")
 The complete diff it produced, as committed:
 $diff
 
-Decide, for each finding id separately, whether this diff actually fixes THAT
-finding.
+Decide, for each finding id you are asked about below, whether this diff
+actually fixes THAT finding.
 
 Rules:
 - Read the surrounding code. A diff cannot prove itself correct: a change can
   look right in isolation and still break a caller that is not shown in it.
 - Set approved=false when the fix is incomplete, treats a symptom rather than
-  the defect, weakens or deletes a test, or introduces a new defect.
-- Set approved=false when nothing in the diff plausibly addresses the finding
-  at all.
+  the defect, weakens or deletes a test, introduces a new defect, or plainly
+  does not address the finding at all.
+- Set approved=true when the fix correctly addresses the finding and breaks
+  nothing - even if you would have written it differently. Style, naming,
+  structure and "could have been more thorough" are not grounds for rejection.
+- Do not manufacture findings. Any diff over more than one file contains
+  something you would have done another way; that is not a defect. If a fix
+  is sound, say so plainly. An honest approval is the expected outcome of a
+  competent fix, not a failure of vigilance.
 - When approved=false, 'objection' is handed verbatim to the agent that has
   to act on it. Say what is wrong and what would have to change. "Looks
   wrong" is not actionable and wastes a round.
-- Approving a bad fix is worse than rejecting a good one: a rejected fix gets
-  another attempt, an approved one gets merged.
-- Return exactly one entry per finding id, no more and no fewer.
+- You are not the last line of defence and must not act as though you were.
+  Nothing is merged on your word: G1 rejects any change under .github/, G2
+  rejects a dropped or invented finding id, the repository's own required CI
+  must pass, and a human reads the pull request before anything lands. Nor
+  is a rejection free - it costs another fix round, and when the rounds run
+  out the run halts with nothing merged and the work parked for a human.
+  Reject what is wrong. Approve what is right.
+${carried:+
+These were approved by an earlier round of this review, and the re-fix since
+then did not touch their code: $carried. Those approvals stand and you are
+not being asked to revisit them.
+}
+Answer for exactly these finding ids, one entry each, no more and no fewer:
+$(printf '%s' "$scope" | jq -r '.[] | "- \(.)"')
 PROMPT
 }
 
+# The ids round $round must examine, as a JSON array.
+#
+# Round 1 examines every confirmed finding. A later round examines what the
+# previous round rejected, plus any finding whose code the re-fix actually
+# touched; everything else keeps the approval it already earned. Reviewing
+# all N findings from scratch every round is what made this stage
+# non-terminating: each round is an independent adversarial read, so a round
+# that clears the objection it was given is free to reject a different
+# finding it approved last round, forever. Observed live: rounds rejecting
+# finding #2, then #5, then #8 of the same eight.
+#
+# "Touched" is read from the paths the re-fix actually changed (git, via
+# af_gate_changed_paths), mapped onto findings through the finding's own
+# file plus every files_changed any fix round claimed for it. The claims are
+# agent-supplied and so untrusted. A claim can never take a finding OUT of
+# the scope - the confirmed finding's own file is in the map regardless of
+# what any agent says. A changed path that maps to no finding at all cannot
+# be reasoned about, so it re-opens everything, as does a missing path
+# record. The bound that is NOT proven: an agent that claims a path it had
+# no business touching turns that path from unattributable (re-open
+# everything) into attributed (re-open the claimant), and what is left is
+# that the reviewer reads the whole cumulative diff while reviewing the
+# claimant, stray edit included.
+af_review_scope() {
+  local iter="$1" round="$2" prev=$(( $2 - 1 )) claims='[]' r
+  local -a src=()
+  if [ "$round" -le 1 ] || [ ! -s "$iter/review-$prev.json" ] \
+     || [ ! -f "$iter/refix-$prev.paths" ]; then
+    jq -c '[.[].id]' "$iter/confirmed.json"
+    return 0
+  fi
+  if [ -f "$iter/fixed.json" ]; then src+=("$iter/fixed.json"); fi
+  r=1
+  while [ "$r" -le "$prev" ]; do
+    if [ -f "$iter/refix-$r.json" ]; then src+=("$iter/refix-$r.json"); fi
+    r=$(( r + 1 ))
+  done
+  if [ "${#src[@]}" -gt 0 ]; then
+    claims="$(jq -s -c '[ .[] | .results[]? | {id, files: (.files_changed // [])} ]' \
+      "${src[@]}")"
+  fi
+  jq -c -n --argjson claims "$claims" \
+    --slurpfile conf "$iter/confirmed.json" \
+    --slurpfile rev "$iter/review-$prev.json" \
+    --rawfile changed "$iter/refix-$prev.paths" '
+    ($conf[0] | map(.id)) as $all
+    | ($changed | split("\n") | map(select(. != ""))) as $touched
+    | ( [ $conf[0][] | {id, f: .file} ]
+        + [ $claims[] | .id as $i | .files[] | {id: $i, f: .} ] ) as $own
+    | if any($touched[]; . as $p | all($own[]; .f != $p)) then $all
+      else
+        ( [ $rev[0].reviews[] | select(.approved | not) | .id ]
+          + [ $own[] | select(.f as $f | any($touched[]; . == $f)) | .id ] )
+        | map(select(. as $i | any($all[]; . == $i)))
+        | unique
+      end'
+}
+
+# Fills this round's file with the previous round's verdict for every id
+# this round was not asked about, so the merged file still carries exactly
+# one verdict per finding id (G2) rather than omitting the settled ones.
+#
+# What it carries is always an approval: every id the previous round
+# rejected is in this round's scope by construction. It never overwrites an
+# id this round did answer - the reviewer is told not to revisit a carried
+# finding, but one that volunteers a rejection anyway has spotted something,
+# and silencing it here would be exactly the omission G2 exists to catch.
+af_review_carry() {
+  local iter="$1" round="$2" prev=$(( $2 - 1 )) f="$1/review-$2.json"
+  [ "$round" -gt 1 ] && [ -s "$iter/review-$prev.json" ] || return 0
+  jq -c --slurpfile p "$iter/review-$prev.json" --arg n "$prev" '
+    [.reviews[].id] as $done
+    | .reviews += [ $p[0].reviews[]
+        | select(.id as $i | all($done[]; . != $i))
+        | {id, approved,
+           reason: "carried forward from round \($n): \(.reason)"} ]
+  ' "$f" > "$f.merged"
+  mv "$f.merged" "$f"
+}
+
 af_step_review() {
-  local iter="$1" round="$2" prompt diff
+  local iter="$1" round="$2" prompt diff scope missing
   # af_git, never a bare `git -C "$AF_WORKTREE"`: the worktree's .git is a
   # pointer file the preceding write-mode agent could have repointed, and a
   # diff read through a gitdir the fixer chose is a diff the fixer wrote.
   # See af_assert_worktree_git.
   diff="$(af_git diff "$AF_BASE_SHA..HEAD")" \
     || af_die "review round $round: could not read the fix diff" "$AF_EX_GATE"
-  prompt="$(af_prompt_review "$iter" "$diff")"
+  scope="$(af_review_scope "$iter" "$round")" \
+    || af_die "review round $round: could not compute the review scope" "$AF_EX_GATE"
+  printf '%s\n' "$scope" > "$iter/review-$round.scope"
+  prompt="$(af_prompt_review "$iter" "$diff" "$scope")"
   ( cd "$AF_WORKTREE" && af_run_agent review "$AF_MODEL_REVIEW" \
       "$AF_BUDGET_REVIEW" ro "$AF_SCHEMA_REVIEW" \
       "$iter/review-$round.json" "$iter/review-$round.log" "$prompt" ) \
     || af_die "review round $round failed" "$?"
 
-  # G2 again: a reviewer that silently drops a finding has approved it by
+  # G2, first half: every id this round was ASKED about must come back with
+  # a verdict, checked BEFORE anything is carried forward. Letting a carried
+  # approval fill the gap for an id the reviewer ducked would be approval by
   # omission, which is the one thing this stage exists to prevent.
+  missing="$(jq -r --slurpfile r "$iter/review-$round.json" \
+    '[ .[] | select(. as $i | all($r[0].reviews[].id; . != $i)) ] | join(", ")' \
+    "$iter/review-$round.scope")"
+  [ -z "$missing" ] || af_die "G2 (review round $round): no verdict returned for $missing" \
+    "$AF_EX_SCHEMA"
+
+  af_review_carry "$iter" "$round"
+
+  # G2, second half: the merged file - what the loop and the PR body
+  # actually read - carries exactly one verdict per confirmed finding. Also
+  # catches an invented id, which carrying forward never removes.
   af_assert_id_sets "$iter/confirmed.json" '.[].id' \
                     "$iter/review-$round.json" '.reviews[].id' \
                     "review round $round"
@@ -979,7 +1117,10 @@ af_step_refix() {
   af_assert_id_sets "$iter/confirmed.json" '.[].id' \
                     "$iter/refix-$round.json" '.results[].id' \
                     "refix round $round"
-  af_gate_changed_paths
+  # The path list is recorded as well as gated: it is what the next round's
+  # review scope is computed from, and it has to come from git rather than
+  # from the re-fix agent's own account of what it changed.
+  af_gate_changed_paths "$iter/refix-$round.paths"
   # Same reasoning as af_step_cifix: a round that changed nothing has nothing
   # to commit, and git's raw "nothing to commit" (exit 1, this project's
   # usage code) would read as a preflight bug in a cron log.

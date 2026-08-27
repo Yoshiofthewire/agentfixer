@@ -106,6 +106,41 @@ the amended work exactly as they do on the first pass, and the round is
 committed on top. Then it is reviewed again. Up to `AF_REVIEW_ROUNDS` review
 calls (default 3).
 
+**A later round does not re-litigate what an earlier one approved.** Round 1
+reviews every finding. Round 2 onwards reviews what the previous round
+rejected, plus any finding whose code the re-fix actually touched; the rest
+keep the approval they already earned, carried into the round's output so
+that exactly one verdict per finding id still reaches G2. Without this the
+loop cannot converge: each round is an independent adversarial read, so a
+round that clears the objection it was given is free to reject a *different*
+finding it approved last round, round after round, until the cap.
+
+"Touched" is read from the paths the re-fix changed according to git — not
+from the agent's own account of what it changed — mapped onto findings
+through each finding's own file plus every `files_changed` any fix round
+claimed for it. A changed path that maps to no finding at all re-opens every
+finding, because an unattributable edit cannot be reasoned about. Adding a
+finding to the map never removes another from the scope — a finding's own
+file is in the map whatever any agent claims — but note the bound honestly:
+an agent that claims a path it had no business touching does convert that
+path from unattributable (re-open everything) to attributed (re-open the
+claimant), and the residual protection is that the reviewer reads the whole
+cumulative diff, stray edit included, while reviewing the claimant. The reviewer is told which findings were settled and why, and asked
+not to revisit them; if it volunteers a rejection for one anyway, that
+rejection is honoured rather than discarded.
+
+The reviewer's prompt carries an explicit bar in both directions: reject an
+incomplete fix, a symptom fix, a weakened test, a new defect, or a diff that
+plainly does not address the finding — but **approve** a fix that addresses
+the finding and breaks nothing, even one you would have written differently.
+Style, naming, structure and "could have been more thorough" are not grounds
+for rejection, and the prompt says so, along with what is downstream of the
+review (G1, G2, the repository's own required CI, and a human reading the
+PR). An earlier version of this prompt told the reviewer only that approving
+a bad fix is worse than rejecting a good one, with no counterweight; across
+three live runs it never once approved, because a sufficiently adversarial
+reader always finds one imperfection somewhere in a multi-file diff.
+
 **If the cap is reached with objections still outstanding**, agentfixer:
 
 - pushes the branch and opens the PR anyway — a human has to be able to see
@@ -240,8 +275,9 @@ recommended.
 | 3 | a safety gate tripped mid-run: `.github/` was touched (G1), the changed-path list behind G1 could not be read at all, the fix reviewer never approved within `AF_REVIEW_ROUNDS` (G4 — PR opened and labelled `needs-human`, nothing merged), the PR has zero required checks (G3), their state could not be read at all (G3 — a `gh` error is not evidence of anything, so it refuses), the merge-time recheck of required checks finds them not passing (G3), the merge itself was refused by GitHub, or `bwrap` is unavailable for a write-mode step and `--no-sandbox` wasn't passed |
 | 4 | an agent returned invalid, incomplete, or non-schema-conforming output — includes the verify/fix id-set mismatch (G2) and `combine` inventing non-canonical ids |
 | 5 | a step hit its `--max-budget-usd` cap. Nothing is malformed — the output just wasn't finished. The message names the step, the cap, the spend, and the `AF_BUDGET_*` variable to raise (see Cost below) |
+| 6 | the Claude API could not complete a call — a rate limit, a session limit, a 5xx. The message names the step, the HTTP status, and the upstream's own reason. Nothing agentfixer or the repository produced was rejected; committed work is left in the worktree and the run can be re-run once the limit clears |
 
-Codes 2–5 can fire after real spend has already happened (audit and verify
+Codes 2–6 can fire after real spend has already happened (audit and verify
 always run, and cost money, before the first write-mode step); code 1 never
 does — every preflight check runs before anything else, so a code-1 exit is
 always a zero-spend exit. A missing `bwrap` is code 3, not code 1, precisely
@@ -259,6 +295,11 @@ Code 5 is deliberately distinct from code 4: a cron log reading "exit 4"
 should send someone looking for a schema bug, and a budget cap running out
 is not one — it's an operational limit that needs a bigger number, not a
 fix to agentfixer's output validation.
+
+Code 6 is distinct for the same reason and is the one code nothing in this
+tool or your repository caused: the upstream call failed. Two live runs
+ended this way mid-review-loop, on a 429 session limit, and both reported
+"agent reported failure" with exit 4 — which is what code 6 exists to stop.
 
 ## Cost
 

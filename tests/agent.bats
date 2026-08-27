@@ -155,3 +155,46 @@ setup() {
   run bash -c "$SRC af_run_agent probe opus 1 ro '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' 'hi'; echo SPEND=\$(af_total_spend)"
   [[ "$output" == *"SPEND=0.01"* ]]
 }
+
+# An upstream API failure is not malformed output, for the same reason
+# budget exhaustion is not: agentfixer's contract was never violated, the
+# call simply could not complete. Both live runs that stopped short of the
+# review cap died here - `claude` returned a 429 session limit - and were
+# reported as "agent reported failure", exit 4, which sends whoever reads
+# the cron log hunting a schema bug that does not exist.
+#
+# The envelope below is the shape the real CLI produced on those runs
+# (claude 2.1.246, trimmed): is_error true, subtype "success" of all things,
+# terminal_reason "api_error", the status in api_error_status and the cause
+# in .result.
+@test "an upstream API error exits 6, not 4" {
+  stub_claude_raw review '{"is_error":true,"subtype":"success","terminal_reason":"api_error","api_error_status":429,"result":"You'"'"'ve hit your session limit · resets 2:40am (America/New_York)","total_cost_usd":4.56,"structured_output":null}'
+  printf '1' > "$AF_STUB_DIR/claude/review.exit"
+  run bash -c "$SRC af_run_agent review opus 3 ro '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' 'hi'"
+  [ "$status" -eq 6 ]
+}
+
+@test "an upstream API error names the status and the upstream's own reason" {
+  stub_claude_raw review '{"is_error":true,"subtype":"success","terminal_reason":"api_error","api_error_status":429,"result":"You'"'"'ve hit your session limit · resets 2:40am (America/New_York)","total_cost_usd":4.56,"structured_output":null}'
+  run bash -c "$SRC af_run_agent review opus 3 ro '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' 'hi'"
+  [[ "$output" == *"429"* ]]
+  [[ "$output" == *"session limit"* ]]
+  [[ "$output" == *"review"* ]]
+  refute_grep 'agent reported failure' <<<"$output"
+}
+
+# A 5xx is the same class of event and must not be reported differently.
+@test "an upstream 500 is classified the same way as a rate limit" {
+  stub_claude_raw probe '{"is_error":true,"subtype":"success","api_error_status":500,"result":"Internal server error","structured_output":null}'
+  run bash -c "$SRC af_run_agent probe opus 1 ro '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' 'hi'"
+  [ "$status" -eq 6 ]
+  [[ "$output" == *"500"* ]]
+}
+
+# The successful envelope carries api_error_status: null, and a null must
+# not read as an error - every ordinary step would fail if it did.
+@test "a successful call with a null api_error_status is not an upstream error" {
+  stub_claude probe '{"ok":true}'
+  run bash -c "$SRC af_run_agent probe opus 1 ro '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' 'hi'"
+  [ "$status" -eq 0 ]
+}
