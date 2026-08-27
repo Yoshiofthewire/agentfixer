@@ -31,7 +31,7 @@ setup() {
 # that shells out to git, and cifix (whose whole job is reproducing a CI
 # failure) could not run one at all. Real bwrap, real git, no stubs.
 @test "CONFINEMENT: git works inside the sandbox for the run's worktree" {
-  command -v bwrap >/dev/null || skip "bwrap not installed"
+  require_bwrap
   local repo
   repo="$(make_repo alpha)"
   git -C "$repo" update-ref refs/remotes/origin/main HEAD
@@ -42,6 +42,7 @@ setup() {
     \"\${pfx[@]}\" git -C \"\$AF_WORKTREE\" log --oneline -1
     \"\${pfx[@]}\" git -C \"\$AF_WORKTREE\" status --porcelain
     \"\${pfx[@]}\" git -C \"\$AF_WORKTREE\" diff --name-only"
+  debug_output
   [ "$status" -eq 0 ]
   [[ "$output" == *"init"* ]]
 }
@@ -50,16 +51,24 @@ setup() {
 # It does NOT cover $AF_WORKTREE/.git, which is in the read-write bind: see
 # the E1 tests in fix.bats for what stops that pointer file being trusted.
 @test "CONFINEMENT: the repository gitdir is exposed read-only" {
-  command -v bwrap >/dev/null || skip "bwrap not installed"
+  require_bwrap
   local repo
   repo="$(make_repo alpha)"
   git -C "$repo" update-ref refs/remotes/origin/main HEAD
   mkdir -p "$HOME/.claude"
+  # Positive control before the negative assertion: prove the sandbox
+  # actually started and mounted the gitdir by reading HEAD through it.
+  # Without this, a bwrap that fails to launch at all would satisfy "the
+  # write failed" trivially, and the test would pass for the wrong reason.
   run bash -c "$SRC
     af_setup_run '$repo' alpha main >/dev/null
     mapfile -t pfx < <(af_sandbox_prefix)
+    \"\${pfx[@]}\" cat '$repo/.git/HEAD' >/dev/null
+    echo POSITIVE_CONTROL_OK
     \"\${pfx[@]}\" bash -c \"echo hack > '$repo/.git/hack'\""
+  debug_output
   [ "$status" -ne 0 ]
+  [[ "$output" == *"POSITIVE_CONTROL_OK"* ]]
   [ ! -f "$repo/.git/hack" ]
 }
 
@@ -146,42 +155,61 @@ setup() {
 # --- real confinement, not just argv construction ---
 
 @test "CONFINEMENT: secrets outside the worktree are unreadable" {
-  command -v bwrap >/dev/null || skip "bwrap not installed"
+  require_bwrap
   mkdir -p "$HOME/.ssh"
   echo "SUPERSECRET" > "$HOME/.ssh/id_test"
   mkdir -p "$HOME/.claude" "$AF_TMP/wt"
+  echo POSITIVE_CONTROL_MARKER > "$HOME/.claude/marker"
+  # Positive control before the negative assertion: prove the sandbox
+  # actually started by reading a file that IS bound in (~/.claude, ro).
+  # A bwrap that never launches would otherwise satisfy "the secret is
+  # unreadable" trivially - this is exactly the defect a stub bwrap that
+  # always exits 1 exposed: both negative confinement tests reported `ok`.
   run bash -c "$SRC AF_WORKTREE='$AF_TMP/wt'
     mapfile -t pfx < <(af_sandbox_prefix)
+    \"\${pfx[@]}\" cat '$HOME/.claude/marker'
     \"\${pfx[@]}\" cat '$HOME/.ssh/id_test'"
+  debug_output
   [ "$status" -ne 0 ]
+  [[ "$output" == *"POSITIVE_CONTROL_MARKER"* ]]
   [[ "$output" != *"SUPERSECRET"* ]]
 }
 
 @test "CONFINEMENT: the worktree is writable inside the sandbox" {
-  command -v bwrap >/dev/null || skip "bwrap not installed"
+  require_bwrap
   mkdir -p "$HOME/.claude" "$AF_TMP/wt"
   run bash -c "$SRC AF_WORKTREE='$AF_TMP/wt'
     mapfile -t pfx < <(af_sandbox_prefix)
     \"\${pfx[@]}\" bash -c 'echo ok > $AF_TMP/wt/f; cat $AF_TMP/wt/f'"
+  debug_output
   [ "$status" -eq 0 ]
   [[ "$output" == *"ok"* ]]
 }
 
 @test "CONFINEMENT: the filesystem outside the worktree is read-only" {
-  command -v bwrap >/dev/null || skip "bwrap not installed"
+  require_bwrap
   mkdir -p "$HOME/.claude" "$AF_TMP/wt"
+  echo POSITIVE_CONTROL_MARKER > "$AF_TMP/wt/marker"
+  # Positive control before the negative assertion: prove the sandbox
+  # actually started by reading a file through its read-write worktree bind,
+  # so a bwrap that fails to launch cannot satisfy "the write failed" for
+  # free.
   run bash -c "$SRC AF_WORKTREE='$AF_TMP/wt'
     mapfile -t pfx < <(af_sandbox_prefix)
+    \"\${pfx[@]}\" cat '$AF_TMP/wt/marker'
     \"\${pfx[@]}\" bash -c 'echo bad > /etc/af_test_should_fail'"
+  debug_output
   [ "$status" -ne 0 ]
+  [[ "$output" == *"POSITIVE_CONTROL_MARKER"* ]]
 }
 
 @test "CONFINEMENT: network still works, because claude needs it" {
-  command -v bwrap >/dev/null || skip "bwrap not installed"
+  require_bwrap
   mkdir -p "$HOME/.claude" "$AF_TMP/wt"
   run bash -c "$SRC AF_WORKTREE='$AF_TMP/wt'
     mapfile -t pfx < <(af_sandbox_prefix)
     \"\${pfx[@]}\" bash -c 'getent hosts api.anthropic.com >/dev/null'"
+  debug_output
   [ "$status" -eq 0 ]
 }
 
@@ -203,7 +231,7 @@ setup() {
 # dir live inside $AF_WORKTREE (bound read-write, so visible in the sandbox)
 # rather than under $AF_STUB_DIR (which lives under /tmp and is masked).
 @test "E2E: rw mode through af_run_agent reaches claude and extracts output under real bwrap" {
-  command -v bwrap >/dev/null || skip "bwrap not installed"
+  require_bwrap
   mkdir -p "$HOME/.claude" "$AF_TMP/wt/bin" "$AF_TMP/wt/stub/claude"
   cp "$AF_ROOT/tests/stubs/claude" "$AF_TMP/wt/bin/claude"
   chmod +x "$AF_TMP/wt/bin/claude"
@@ -212,7 +240,10 @@ setup() {
   run env AF_STUB_DIR="$AF_TMP/wt/stub" PATH="$AF_TMP/wt/bin:$PATH" \
     bash -c "$SRC AF_WORKTREE='$AF_TMP/wt' AF_SANDBOX=1 AF_RUN_DIR='$AF_TMP'
       af_run_agent probe opus 1 rw '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' hi"
-
+  debug_output
+  # af_run_agent's own error only names the log files; print their content
+  # too, since that's where claude/bwrap's actual stderr landed.
+  [ -f "$AF_TMP/o.log.stderr" ] && cat "$AF_TMP/o.log.stderr" >&2
   [ "$status" -eq 0 ]
   [ "$(jq -c . "$AF_TMP/o.json")" = '{"ok":true}' ]
   grep -q -- 'bypassPermissions' "$AF_TMP/wt/stub/claude/probe.args"

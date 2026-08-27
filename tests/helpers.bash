@@ -75,6 +75,34 @@ refute_grep() {
   fi
 }
 
+# require_bwrap -- skip unless bwrap can actually confine a process.
+#
+# `command -v bwrap` only proves the binary is on PATH. On Ubuntu 24.04+,
+# kernel.apparmor_restrict_unprivileged_userns=1 blocks the unprivileged user
+# namespace bwrap needs, so a present-but-non-functional bwrap exits
+# immediately - and CONFINEMENT tests that assert "X is unreadable"/"Y fails"
+# would then pass for free, proving nothing. Verified locally with a bwrap
+# stub on PATH that always exits 1: both negative confinement tests still
+# reported `ok` when guarded only by `command -v bwrap`.
+#
+# Distinguishes the two failure modes in the skip reason because they need
+# different fixes: install the package, vs. permit user namespaces
+# (kernel.apparmor_restrict_unprivileged_userns=0) or run privileged/in a
+# container.
+require_bwrap() {
+  command -v bwrap >/dev/null 2>&1 || skip "bwrap not installed"
+  local err
+  err="$(bwrap --ro-bind / / --tmpfs /tmp --unshare-pid --die-with-parent true 2>&1)" && return 0
+  skip "bwrap installed but cannot create a user namespace (${err//$'\n'/ })"
+}
+
+# debug_output -- call right after `run`. Bats only shows a test's own stdout
+# when the test fails, so this is silent on success. `run` merges stderr into
+# $output by default, so this is what puts bwrap's actual error in the CI log
+# instead of a bare "status -eq 0 failed" with no cause, which is what made
+# the original CI failures undiagnosable from the log alone.
+debug_output() { printf 'output was:\n%s\n' "$output"; }
+
 gh_calls() { cat "$AF_STUB_DIR/gh/calls.log" 2>/dev/null || true; }
 
 tmux_calls() { cat "$AF_STUB_DIR/tmux.log" 2>/dev/null || true; }

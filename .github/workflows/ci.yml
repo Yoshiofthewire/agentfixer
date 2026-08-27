@@ -14,4 +14,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y bats jq bubblewrap tmux
+      # ubuntu-latest (24.04) blocks unprivileged user namespaces by default,
+      # which bwrap needs; without this, every sandbox test either fails
+      # (positive assertions) or trivially "passes" for the wrong reason
+      # (negative assertions never got a chance to run against real
+      # confinement). See tests/helpers.bash:require_bwrap.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: verify bwrap can actually sandbox
+        run: |
+          bwrap --ro-bind / / --tmpfs /tmp --unshare-pid --die-with-parent true || {
+            echo "::error::bwrap cannot create a user namespace even after the sysctl;" \
+                 "sandbox tests would run with zero real coverage. Fix the runner" \
+                 "(container/privileged job) instead of letting them skip." >&2
+            exit 1
+          }
       - run: bats tests/
