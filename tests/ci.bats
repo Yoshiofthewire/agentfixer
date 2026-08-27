@@ -129,6 +129,54 @@ setup() {
   [ "$(grep -c -- '--print' "$AF_STUB_DIR/claude/cifix.args")" -eq 1 ]
 }
 
+# The PR is opened non-draft on the happy path so CI and auto-merge behave
+# normally. Once CI is exhausted it must not stay mergeable: converting it back
+# to a draft is what stops a human merging a PR whose checks never went green.
+@test "CI exhaustion converts the open PR back to a draft" {
+  stub_gh "$(gh_key pr checks)" '[{"bucket":"fail","name":"t"}]'
+  stub_gh "$(gh_key run list)" '4242'
+  stub_gh "$(gh_key run view)" 'FAIL'
+  stub_claude cifix '{"diagnosis":"d","files_changed":["a.ts"],"confident":false}'
+  stub_claude_side_effect cifix 'echo again > a.ts'
+  run bash -c "$SRC
+    af_setup_run '$REPO' alpha main >/dev/null
+    git -C \"\$AF_WORKTREE\" push -q --set-upstream origin \"\$AF_BRANCH\"
+    af_ci_loop '$ITER' 7"
+  [ "$status" -eq 2 ]
+  grep -q -- 'pr ready 7 --repo test/alpha --undo' "$AF_STUB_DIR/gh/calls.log"
+  grep -q 'label create needs-human' "$AF_STUB_DIR/gh/calls.log"
+}
+
+@test "a CI timeout converts the open PR back to a draft" {
+  stub_gh "$(gh_key pr checks)" '[{"bucket":"pending","name":"t"}]'
+  run bash -c "$SRC AF_CI_TIMEOUT=1
+    af_setup_run '$REPO' alpha main >/dev/null
+    af_ci_loop '$ITER' 7"
+  [ "$status" -eq 2 ]
+  grep -q -- 'pr ready 7 --repo test/alpha --undo' "$AF_STUB_DIR/gh/calls.log"
+}
+
+@test "zero required checks converts the open PR back to a draft" {
+  stub_gh "$(gh_key pr checks)" '[]'
+  run bash -c "$SRC AF_CHECKS_GRACE=0
+    af_setup_run '$REPO' alpha main >/dev/null
+    af_ci_loop '$ITER' 7"
+  [ "$status" -eq 3 ]
+  grep -q -- 'pr ready 7 --repo test/alpha --undo' "$AF_STUB_DIR/gh/calls.log"
+}
+
+# A failed conversion is reported and swallowed: the CI failure is the news,
+# and a gh error here must not replace its exit code.
+@test "a failed draft conversion is reported but keeps the CI exit code" {
+  stub_gh "$(gh_key pr checks)" '[{"bucket":"pending","name":"t"}]'
+  stub_gh_fail "$(gh_key pr ready)" 1 "GraphQL: Draft pull requests are not supported"
+  run bash -c "$SRC AF_CI_TIMEOUT=1
+    af_setup_run '$REPO' alpha main >/dev/null
+    af_ci_loop '$ITER' 7"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"stays mergeable"* ]]
+}
+
 @test "three failures halt the whole run with exit 2 and label the PR" {
   stub_gh "$(gh_key pr checks)" '[{"bucket":"fail","name":"t"}]'
   stub_gh "$(gh_key run list)" '4242'

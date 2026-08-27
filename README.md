@@ -145,9 +145,9 @@ reader always finds one imperfection somewhere in a multi-file diff.
 
 - pushes the branch and opens the PR anyway — a human has to be able to see
   what the reviewer refused,
+- opens it as a **draft** labelled `needs-human` (see *Halted runs*, below),
 - writes the unresolved objections into the PR body under
   `### Fix review` → **Not approved**,
-- labels it `needs-human`,
 - and **halts the run with exit 3 without merging**. It does not proceed to
   CI or merge, and it does not start another iteration on top of code a
   reviewer never cleared.
@@ -161,6 +161,54 @@ the PR wants to know.
 goes straight to `pr`, and the PR body says so. It does not mean "review once
 and never loop back"; that reading would make `0` a synonym for `1`. The
 value is validated before preflight, so a typo is a zero-spend exit 1.
+
+## Halted runs leave a draft PR, never stranded commits
+
+Every PR agentfixer opens on a **halt path is a draft, labelled
+`needs-human`**. The only non-draft PR it opens is the happy path's, on its
+way to CI and merge.
+
+The reason is that a draft cannot be merged until a human deliberately marks
+it ready — precisely the property wanted for work that did not clear its
+gates. It is also the reason the work is published at all: a run that dies
+after `fix` has already committed leaves real commits in
+`~/.cache/agentfixer/<repo>/<timestamp>/worktree`, invisible unless somebody
+goes digging.
+
+| halt | what happens to the PR |
+|---|---|
+| exit 6, upstream API failure (rate limit, session limit, 5xx) | pushed and opened as a draft, if the branch has commits ahead of the base |
+| exit 5, budget cap exhausted | same |
+| exit 3, review cap reached with objections | opened as a draft |
+| exit 2, CI retries exhausted, or CI timed out | the open PR is converted back to a draft (`gh pr ready --undo`) |
+| exit 3, no required checks appeared, or their state could not be read | same |
+| **exit 3, G1: an agent wrote under `.github/`** | **no PR, nothing pushed** |
+
+**G1 is deliberately excluded.** G1 fires when an agent created or modified
+something under `.github/`, which is hostile or malfunctioning output.
+Publishing that content to a branch on the remote is the wrong response;
+halting with the work quarantined locally is the right one. No `gh pr create`
+runs on that path, and nothing reaches the remote.
+
+The halt PR's body opens with a banner stating why the run halted (including
+the upstream's own HTTP status and message), which commits are in the branch,
+what was *not* done — not reviewed, review rejected it, never reached CI —
+and that the draft is deliberate, with a checklist of what to confirm before
+marking it ready. agentfixer's ordinary report follows *underneath* the
+banner, so a body listing "Fixed" findings can never be mistaken for the
+provenance of a clean run.
+
+Opening the rescue PR can itself fail — the session limit that killed the run
+may still be in force. When it does, both failures are reported and the run
+still exits with the **original** code, never the PR failure's: the reason
+the run actually died is the reason the operator needs. The commits stay in
+the worktree either way; `af_cleanup_worktree` never deletes a worktree
+holding unmerged work, PR or no PR.
+
+Draft support is per-repository and plan-gated on GitHub
+(`Repository.planFeatures.draftPullRequests`), so `--draft` and
+`gh pr ready --undo` can both be refused. Neither failure is fatal, and
+neither is silent.
 
 ## Branch protection is required
 
@@ -253,9 +301,14 @@ recommended.
   range before a merge, are both checked, including renames into or out of
   `.github/`.
 - Merge a fix its reviewer never approved. If the review loop hits
-  `AF_REVIEW_ROUNDS` with objections outstanding, the PR is opened and
+  `AF_REVIEW_ROUNDS` with objections outstanding, a **draft** PR is opened and
   labelled `needs-human`, and the run halts at exit 3 — no CI, no merge, no
   next iteration.
+- Leave a mergeable PR behind after a halt. Every PR opened on a halt path is
+  a draft labelled `needs-human`; a PR already open when a gate trips is
+  converted back to a draft. See *Halted runs*.
+- Publish `.github/` tampering. A G1 trip opens no PR and pushes nothing —
+  the work stays quarantined in the local worktree.
 - Force push. Ever.
 - Touch your working tree. All work happens in a throwaway git worktree
   under `~/.cache/agentfixer/<repo>/<timestamp>/worktree` (override the cache
@@ -271,11 +324,11 @@ recommended.
 |---|---|
 | 0 | completed |
 | 1 | usage error, or a preflight check failed before the run started — nothing was spent |
-| 2 | CI could not be made green (timed out, or exhausted its retries); the PR is left open, labelled `needs-human` |
-| 3 | a safety gate tripped mid-run: `.github/` was touched (G1), the changed-path list behind G1 could not be read at all, the fix reviewer never approved within `AF_REVIEW_ROUNDS` (G4 — PR opened and labelled `needs-human`, nothing merged), the PR has zero required checks (G3), their state could not be read at all (G3 — a `gh` error is not evidence of anything, so it refuses), the merge-time recheck of required checks finds them not passing (G3), the merge itself was refused by GitHub, or `bwrap` is unavailable for a write-mode step and `--no-sandbox` wasn't passed |
+| 2 | CI could not be made green (timed out, or exhausted its retries); the PR is left open, converted back to a **draft** and labelled `needs-human` |
+| 3 | a safety gate tripped mid-run: `.github/` was touched (G1), the changed-path list behind G1 could not be read at all, the fix reviewer never approved within `AF_REVIEW_ROUNDS` (G4 — a **draft** PR is opened and labelled `needs-human`, nothing merged), the PR has zero required checks (G3 — the PR is converted back to a draft and labelled `needs-human`), their state could not be read at all (G3 — a `gh` error is not evidence of anything, so it refuses), the merge-time recheck of required checks finds them not passing (G3), the merge itself was refused by GitHub, or `bwrap` is unavailable for a write-mode step and `--no-sandbox` wasn't passed |
 | 4 | an agent returned invalid, incomplete, or non-schema-conforming output — includes the verify/fix id-set mismatch (G2) and `combine` inventing non-canonical ids |
-| 5 | a step hit its `--max-budget-usd` cap. Nothing is malformed — the output just wasn't finished. The message names the step, the cap, the spend, and the `AF_BUDGET_*` variable to raise (see Cost below) |
-| 6 | the Claude API could not complete a call — a rate limit, a session limit, a 5xx. The message names the step, the HTTP status, and the upstream's own reason. Nothing agentfixer or the repository produced was rejected; committed work is left in the worktree and the run can be re-run once the limit clears |
+| 5 | a step hit its `--max-budget-usd` cap. Nothing is malformed — the output just wasn't finished. The message names the step, the cap, the spend, and the `AF_BUDGET_*` variable to raise (see Cost below). Work already committed is preserved as a draft PR |
+| 6 | the Claude API could not complete a call — a rate limit, a session limit, a 5xx. The message names the step, the HTTP status, and the upstream's own reason. Nothing agentfixer or the repository produced was rejected; committed work is preserved as a draft PR labelled `needs-human` (see *Halted runs*) and the run can be re-run once the limit clears |
 
 Codes 2–6 can fire after real spend has already happened (audit and verify
 always run, and cost money, before the first write-mode step); code 1 never

@@ -203,6 +203,37 @@ mkdir -p .github/workflows && echo evil > .github/workflows/ci.yml
   [ "$(grep -c 'Run the /security-audit skill' "$AF_STUB_DIR/claude/audit-sec.args")" -eq 1 ]
 }
 
+# The cap is a halt path, and a halt-path PR is a draft: a PR whose reviewer
+# never approved must not be one click from merging. Asserted on the flag that
+# actually reached `gh pr create`, not on the PR body.
+@test "the PR opened at the review cap is a draft" {
+  stub_claude_side_effect review "$REVIEW_NEVER"
+  stub_claude_side_effect refix "$REFIX_OK"
+  run bash -c "$SRC AF_REVIEW_ROUNDS=2; af_run_repo '$REPO' alpha 1"
+  debug_output
+  [ "$status" -eq 3 ]
+  grep -qE 'pr create .*--draft' "$AF_STUB_DIR/gh/calls.log"
+  grep -q 'label create needs-human' "$AF_STUB_DIR/gh/calls.log"
+}
+
+# A body whose "Fixed" list reads exactly like a clean run's would pass work
+# the reviewer refused off as reviewed. The halt has to be visible at the top.
+@test "the review-cap PR body opens with the halt banner, not the normal report" {
+  stub_claude_side_effect review "$REVIEW_NEVER"
+  stub_claude_side_effect refix "$REFIX_OK"
+  run bash -c "$SRC AF_REVIEW_ROUNDS=2; af_run_repo '$REPO' alpha 1"
+  [ "$status" -eq 3 ]
+  run cat "$AF_TMP"/cache/alpha/*/iter-01/pr-body.md
+  debug_output
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"[!WARNING]"* ]]
+  [[ "$output" == *"draft on purpose"* ]]
+  [[ "$output" == *"exit 3"* ]]
+  [[ "$output" == *"The review rejected it"* ]]
+  # The banner comes first, then the ordinary report.
+  [[ "${output%%"## agentfixer"*}" == *"[!WARNING]"* ]]
+}
+
 @test "the branch is pushed when the cap is reached, so the PR has content" {
   stub_claude_side_effect review "$REVIEW_NEVER"
   stub_claude_side_effect refix "$REFIX_OK"

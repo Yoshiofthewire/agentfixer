@@ -17,7 +17,19 @@ readonly AF_EX_BUDGET=5
 # shellcheck disable=SC2034
 readonly AF_EX_UPSTREAM=6
 
-af_die() { printf 'agentfixer: %s\n' "$1" >&2; exit "${2:-$AF_EX_USAGE}"; }
+# The halt reason is recorded as well as printed: af_die often runs inside a
+# background subshell (af_with_spinner, the parallel audits), whose variables
+# never reach the parent, and the EXIT trap needs the reason to write it into
+# a rescue PR body. First write wins - the innermost af_die is the specific
+# one, and the outer "step X failed" wrappers only restate it.
+af_die() {
+  if [ -n "${AF_RUN_DIR:-}" ] && [ -d "${AF_RUN_DIR:-}" ] \
+     && [ ! -f "$AF_RUN_DIR/halt.txt" ]; then
+    printf '%s\n' "$1" > "$AF_RUN_DIR/halt.txt" 2>/dev/null || :
+  fi
+  printf 'agentfixer: %s\n' "$1" >&2
+  exit "${2:-$AF_EX_USAGE}"
+}
 
 # --no-budget / AF_BUDGET=off disable every per-step cap outright: af_run_agent
 # then omits --max-budget-usd entirely rather than passing some large number.
@@ -600,6 +612,13 @@ af_iter_dir() {
   printf '%s\n' "$d"
 }
 
+# Commits the iteration branch has that the base does not: the one question
+# behind every "is there work to lose here" decision. af_cleanup_worktree
+# refuses to delete on it, and the halt paths open a rescue PR on it.
+af_has_commits() {
+  [ -n "$(af_git log --oneline "$AF_BASE_SHA..HEAD")" ]
+}
+
 # Conservative: only remove a worktree that is clean AND fully merged.
 # Deleting a worktree holding unmerged work is data loss; tidiness is not
 # worth it.
@@ -610,7 +629,7 @@ af_cleanup_worktree() {
     af_log warn "worktree is dirty, leaving it: $AF_WORKTREE"
     return 0
   fi
-  if [ -n "$(af_git log --oneline "$AF_BASE_SHA..HEAD")" ]; then
+  if af_has_commits; then
     af_log warn "worktree has unmerged commits, leaving it: $AF_WORKTREE"
     return 0
   fi
@@ -1195,12 +1214,23 @@ af_review_section() {
 # ---------------------------------------------------------------- pull request
 AF_PR_NUM=""
 AF_PR_URL=""
+# The iteration the EXIT trap should report on. A trap takes no arguments, so
+# the current iteration has to be reachable as state. Hard-assigned, like the
+# rest of the run state: ambient environment must not choose it.
+AF_ITER_DIR=""
+AF_ITER_N=""
+AF_ITER_TOTAL=""
 
 af_ensure_labels() {
   gh label create agent-authored --repo "$AF_SLUG" --color B60205 \
     --description "Authored by an automated agent" >/dev/null 2>&1 || true
   gh label create agentfixer --repo "$AF_SLUG" --color 0E8A16 \
     --description "Opened by agentfixer" >/dev/null 2>&1 || true
+  # Every halt path applies this one, and `gh pr edit --add-label` fails on a
+  # label the repository does not have. Creating it here is what makes those
+  # calls actually land rather than silently no-op.
+  gh label create needs-human --repo "$AF_SLUG" --color D93F0B \
+    --description "agentfixer halted; a human has to finish this" >/dev/null 2>&1 || true
 }
 
 af_pr_body() {
@@ -1254,22 +1284,193 @@ BODY
 
 af_step_pr() {
   local iter="$1" n="$2" total="$3" base="$4" title bodyfile
+  local -a draft=()
   af_require_slug
   bodyfile="$iter/pr-body.md"
-  af_pr_body "$iter" "$n" "$total" > "$bodyfile"
+  # An unresolved review cap is a halt path, and every PR a halt path opens is
+  # a draft: this one exists so a human can see what the reviewer refused, not
+  # so it can be merged. The banner goes first because the distinction has to
+  # be visible without scrolling - a body whose "Fixed" list reads exactly
+  # like a clean run's would pass unreviewed work off as reviewed.
+  if [ -f "$iter/review-unresolved" ]; then
+    draft=(--draft)
+    af_halt_banner "$AF_EX_GATE" \
+      "G4: the fix reviewer still objected after $AF_REVIEW_ROUNDS round(s). agentfixer does not merge work its reviewer never approved." \
+      "$iter" > "$bodyfile"
+  else
+    : > "$bodyfile"
+  fi
+  af_pr_body "$iter" "$n" "$total" >> "$bodyfile"
   title="fix: $(jq -r '[.results[] | select(.status == "fixed")] | length' \
     "$iter/fixed.json") verified findings (agentfixer $n/$total)"
+  [ "${#draft[@]}" -eq 0 ] || title="HALTED · needs human: $title"
 
   af_git push --quiet --set-upstream origin "$AF_BRANCH"
   af_ensure_labels
 
   AF_PR_URL="$(cd "$AF_WORKTREE" && gh pr create --repo "$AF_SLUG" \
-    --base "$base" --head "$AF_BRANCH" \
+    --base "$base" --head "$AF_BRANCH" "${draft[@]}" \
     --title "$title" --body-file "$bodyfile" \
     --label agent-authored --label agentfixer)"
   AF_PR_NUM="${AF_PR_URL##*/}"
   printf '%s\n' "$AF_PR_URL" > "$iter/pr.txt"
   [ -n "$AF_PR_NUM" ] || af_die "could not determine PR number from: $AF_PR_URL" "$AF_EX_SCHEMA"
+}
+
+# ------------------------------------------------------------ halted runs
+# Every PR agentfixer opens on a halt path is a DRAFT labelled needs-human.
+# GitHub will not merge a draft until a human deliberately marks it ready,
+# which is exactly the property wanted for work that did not clear its gates.
+# The only non-draft PR this tool opens is the happy path's, on its way to CI
+# and merge. Draft support is per-repository and plan-gated - the GraphQL
+# field is Repository.planFeatures.draftPullRequests - so both the create and
+# the convert can legitimately fail; neither is ever allowed to be fatal.
+
+# One markdown bullet per gate the work never passed. What a human landing on
+# a halted PR needs first is not what was done, but what was not.
+af_halt_not_done() {
+  local iter="$1" rounds=""
+  if [ -f "$iter/review-rounds" ]; then rounds="$(cat "$iter/review-rounds")"; fi
+  if [ -z "$rounds" ]; then
+    printf -- '- **Not reviewed.** The run died before the fix reviewer reported.\n'
+  elif [ "$rounds" = "0" ]; then
+    printf -- "- **Not reviewed.** The review stage was disabled (\`AF_REVIEW_ROUNDS=0\`).\n"
+  elif [ -f "$iter/review-unresolved" ]; then
+    printf -- "- **The review rejected it.** An independent reviewer still objected after %s round(s); the objections are under \`### Fix review\` below.\n" "$rounds"
+  else
+    printf -- '- Reviewed and approved in round %s — and that is the only gate it passed.\n' "$rounds"
+  fi
+  printf -- '- **Never reached CI.** No required check has run against this branch, and nothing was merged.\n'
+}
+
+# The header every halt-path PR body opens with. The body is the only place a
+# human learns what happened, so it says it in the first screenful rather than
+# leaving it to be inferred from a section further down.
+af_halt_banner() {
+  local rc="$1" why="$2" iter="$3" commits notdone
+  # Computed before the heredoc, not inside it: a command substitution nested
+  # in an unquoted heredoc that itself needs backticks is unreadable, and
+  # unreadable quoting is how a body silently comes out half-empty.
+  commits="$(af_git log --format="- \`%h\` %s" "$AF_BASE_SHA..HEAD")"
+  notdone="$(af_halt_not_done "$iter")"
+  cat <<BANNER
+> [!WARNING]
+> **agentfixer halted. This PR is a draft on purpose — do not mark it ready
+> for review until you have read the diff yourself.**
+
+The run stopped before this work could clear the gates a normal agentfixer PR
+clears. It is published so the commits are not stranded in a cache directory
+nobody looks in, and published as a **draft** so nobody merges them by reflex.
+
+### Why the run halted (exit $rc)
+
+\`\`\`
+$why
+\`\`\`
+
+### What is in this branch
+
+$commits
+
+### What was NOT done
+
+$notdone
+
+### Before you mark this ready for review
+
+- Read the diff. Nothing downstream of the halt vouched for it.
+- Run the repository's tests and required checks against this branch.
+- If the work is not worth keeping, close this PR and delete the branch.
+
+Everything below is agentfixer's ordinary report for the iteration that was
+running when it halted. Read it as what the agents *claimed*, not as
+provenance for work that was checked.
+
+---
+
+BANNER
+}
+
+# What every halt path with a PR already open does: label it, and take it back
+# out of "ready to merge". `gh pr ready --undo` converts a PR to a draft (gh
+# 2.98.0, GraphQL convertPullRequestToDraft); a PR whose checks never went
+# green must not sit one click away from merging. Neither call may take the
+# run down - the halt that got us here is the news, and a failure to relabel
+# must not replace it.
+af_pr_needs_human() {
+  af_ensure_labels
+  gh pr edit "$1" --repo "$AF_SLUG" --add-label needs-human >/dev/null 2>&1 \
+    || af_log warn "could not label PR #$1 needs-human"
+  gh pr ready "$1" --repo "$AF_SLUG" --undo >/dev/null 2>&1 \
+    || af_log warn "could not convert PR #$1 to a draft; it stays mergeable"
+}
+
+# An upstream API failure or an exhausted budget stops the run for a reason
+# that has nothing to do with the code - and can stop it after `fix` has
+# already committed real work. Left alone those commits sit in
+# ~/.cache/agentfixer/<repo>/<stamp>/worktree, invisible unless someone goes
+# digging. Push them and open a draft PR instead.
+#
+# The case list is exactly {budget, upstream}, and deliberately excludes every
+# gate trip. G1 fires when an agent wrote under .github/, i.e. hostile or
+# malfunctioning output; publishing that to a branch on the remote is the
+# wrong response, and quarantining it locally is the right one.
+#
+# Nothing here may change the exit code. The original failure is why the run
+# died and is what the operator has to be told, so every failure in this
+# function is reported and swallowed.
+af_rescue_pr() {
+  local rc="$1" why url bodyfile
+  case "$rc" in "$AF_EX_BUDGET"|"$AF_EX_UPSTREAM") ;; *) return 0 ;; esac
+  [ -n "${AF_WORKTREE:-}" ] && [ -d "$AF_WORKTREE" ] || return 0
+  [ -n "${AF_SLUG:-}" ] && [ -n "${AF_ITER_DIR:-}" ] || return 0
+  # Same question af_cleanup_worktree asks. No commits ahead of the base means
+  # there is nothing to rescue, and an empty PR is worse than none.
+  af_has_commits || return 0
+
+  # A PR is already open for this branch - the halt landed during cifix.
+  # Converting it is the whole job; a second `gh pr create` would only fail.
+  if [ -n "${AF_PR_NUM:-}" ]; then
+    af_pr_needs_human "$AF_PR_NUM"
+    af_log warn "halted with work on PR #$AF_PR_NUM; converted it to a draft"
+    return 0
+  fi
+
+  why="$(cat "$AF_RUN_DIR/halt.txt" 2>/dev/null)" \
+    || why="agentfixer exited $rc; the reason was not recorded."
+  bodyfile="$AF_ITER_DIR/halt-pr-body.md"
+  af_halt_banner "$rc" "$why" "$AF_ITER_DIR" > "$bodyfile" || return 0
+  # Only if the iteration got far enough to have one. A halt during `fix`
+  # itself leaves no fixed.json, and af_pr_body would die reading it.
+  if [ -f "$AF_ITER_DIR/fixed.json" ] && [ -f "$AF_ITER_DIR/confirmed.json" ]; then
+    af_pr_body "$AF_ITER_DIR" "$AF_ITER_N" "$AF_ITER_TOTAL" >> "$bodyfile" || :
+  fi
+
+  if ! af_git push --quiet --set-upstream origin "$AF_BRANCH"; then
+    af_log warn "could not push $AF_BRANCH; the work stays in $AF_WORKTREE"
+    return 0
+  fi
+  af_ensure_labels
+  if ! url="$(cd "$AF_WORKTREE" && gh pr create --repo "$AF_SLUG" \
+      --base "$AF_BASE_BRANCH" --head "$AF_BRANCH" --draft \
+      --title "HALTED · needs human: agentfixer $AF_ITER_N/$AF_ITER_TOTAL (exit $rc)" \
+      --body-file "$bodyfile" \
+      --label agent-authored --label agentfixer --label needs-human 2>&1)"; then
+    af_log warn "could not open a draft PR for the halted work: $url"
+    af_log warn "the commits are still on $AF_BRANCH in $AF_WORKTREE"
+    return 0
+  fi
+  af_log warn "halted work preserved as a draft PR: $url"
+}
+
+# One EXIT trap, so no halt can skip either half, and the rescue runs first:
+# it needs the worktree that af_cleanup_worktree is about to consider
+# removing. `exit "$rc"` last, so neither half can rewrite the exit code.
+af_on_exit() {
+  local rc=$?
+  af_rescue_pr "$rc" || :
+  af_cleanup_worktree "$1" || :
+  exit "$rc"
 }
 
 # ------------------------------------------------------------------- ci
@@ -1415,25 +1616,28 @@ af_ci_loop() {
     case "$state" in
       pass) return 0 ;;
       none)
-        gh pr edit "$pr" --repo "$AF_SLUG" --add-label needs-human >/dev/null 2>&1 || true
+        af_pr_needs_human "$pr"
         af_die "G3: no required checks appeared on PR #$pr within
 ${AF_CHECKS_GRACE}s. If this repo has required status checks configured, this
 may be a slow registration after PR creation - otherwise, enable required
-status checks in branch protection. PR left open." "$AF_EX_GATE" ;;
+status checks in branch protection. PR #$pr is left open as a draft,
+labelled needs-human." "$AF_EX_GATE" ;;
       error*)
-        gh pr edit "$pr" --repo "$AF_SLUG" --add-label needs-human >/dev/null 2>&1 || true
+        af_pr_needs_human "$pr"
         af_die "G3: could not read the required checks of PR #$pr;
 ${state#error: }
-PR left open." "$AF_EX_GATE" ;;
+PR #$pr is left open as a draft, labelled needs-human." "$AF_EX_GATE" ;;
       timeout)
-        gh pr edit "$pr" --repo "$AF_SLUG" --add-label needs-human >/dev/null 2>&1 || true
-        af_die "CI did not settle within ${AF_CI_TIMEOUT}s. PR #$pr left open." \
+        af_pr_needs_human "$pr"
+        af_die "CI did not settle within ${AF_CI_TIMEOUT}s. PR #$pr is left open
+as a draft, labelled needs-human." \
           "$AF_EX_CI" ;;
     esac
     attempt=$(( attempt + 1 ))
     if [ "$attempt" -gt "$AF_CI_RETRIES" ]; then
-      gh pr edit "$pr" --repo "$AF_SLUG" --add-label needs-human >/dev/null 2>&1 || true
-      af_die "CI still failing after $AF_CI_RETRIES attempts. PR #$pr left open.
+      af_pr_needs_human "$pr"
+      af_die "CI still failing after $AF_CI_RETRIES attempts. PR #$pr is left open
+as a draft, labelled needs-human.
 Halting the run: a PR that cannot be made green means something systemic." \
         "$AF_EX_CI"
     fi
@@ -1528,11 +1732,17 @@ af_run_repo() {
   base="$AF_BASE_BRANCH"
   af_setup_run "$dir" "$name" "$base"
   AF_REPO_DIR="$dir"
-  trap 'af_cleanup_worktree "$AF_REPO_DIR"' EXIT
+  trap 'af_on_exit "$AF_REPO_DIR"' EXIT
 
   for (( n = 1; n <= iters; n++ )); do
     AF_ITER_LABEL="iteration $n/$iters"
     iter="$(af_iter_dir "$n")"
+    # The EXIT trap takes no arguments; this is how it finds the iteration
+    # that was running. AF_PR_NUM is cleared with it - stale is worse than
+    # empty here, since the previous iteration's PR is already merged and a
+    # halt in this one must not "convert" it instead of opening its own.
+    AF_ITER_DIR="$iter"; AF_ITER_N="$n"; AF_ITER_TOTAL="$iters"
+    AF_PR_NUM=""; AF_PR_URL=""
     # Each iteration starts from the current base on its own branch. The
     # previous iteration's branch is left alone: after a merge it was reset to
     # this same base sha and holds nothing, and a branch that does hold
@@ -1622,9 +1832,10 @@ af_run_repo() {
     # response (go look at the needs-human PR).
     if [ -f "$iter/review-unresolved" ]; then
       af_require_slug
-      gh pr edit "$AF_PR_NUM" --repo "$AF_SLUG" --add-label needs-human >/dev/null 2>&1 || true
+      af_pr_needs_human "$AF_PR_NUM"
       af_die "G4: the fix reviewer still objected after $AF_REVIEW_ROUNDS round(s).
-PR #$AF_PR_NUM is open and labelled needs-human; the objections are in its body.
+PR #$AF_PR_NUM is open as a draft labelled needs-human; the objections are in
+its body, and it cannot be merged until a human marks it ready.
 Refusing to merge work the reviewer never approved, and halting the run." "$AF_EX_GATE"
     fi
 
