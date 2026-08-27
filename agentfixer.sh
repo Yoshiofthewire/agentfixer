@@ -320,12 +320,21 @@ af_run_agent() {
     args+=(--disallowed-tools 'Edit Write NotebookEdit WebFetch WebSearch')
   fi
 
+  # The prompt travels on stdin, never as a trailing argv word: --disallowed-
+  # tools/--allowed-tools/--add-dir are variadic in the real CLI and greedily
+  # consume every following non-flag argument, so a prompt placed after them
+  # (or after any flag added later) would be swallowed as another tool name
+  # and claude would see no prompt at all. A here-string gives claude its own
+  # fd 0 regardless of what this function's caller's stdin is - true even
+  # when af_run_agent runs backgrounded (af_with_spinner, the parallel audit
+  # subshells) or through the bwrap/env sandbox chain, all verified against
+  # the real binary.
   local rc=0
   if [ "$mode" = "rw" ]; then
-    AF_STEP="$step" "${sandbox_pfx[@]}" "${cred_scrub[@]}" claude "${args[@]}" "$prompt" \
-      > "$log" 2>>"$log.stderr" || rc=$?
+    AF_STEP="$step" "${sandbox_pfx[@]}" "${cred_scrub[@]}" claude "${args[@]}" \
+      > "$log" 2>>"$log.stderr" <<<"$prompt" || rc=$?
   else
-    AF_STEP="$step" claude "${args[@]}" "$prompt" > "$log" 2>>"$log.stderr" || rc=$?
+    AF_STEP="$step" claude "${args[@]}" > "$log" 2>>"$log.stderr" <<<"$prompt" || rc=$?
   fi
   if [ "$rc" -ne 0 ]; then
     af_die "step '$step': claude exited $rc (see $log)" "$AF_EX_SCHEMA"

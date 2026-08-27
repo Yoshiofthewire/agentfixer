@@ -236,6 +236,20 @@ shellcheck agentfixer.sh tests/stubs/*
 Tests stub `claude` and `gh` on `PATH` and run against real temporary git
 repos. `git` is never stubbed — git behaviour is what needs proving.
 
+The `claude` stub models the real CLI's argv parsing on the one axis
+agentfixer.sh depends on (`--disallowed-tools`/`--allowed-tools`/`--add-dir`
+are variadic and swallow whatever follows them), so an argument-ordering
+regression fails the stubbed suite too. But it is still a model, not the
+binary — nothing else here ever calls the real `claude`. Run the opt-in smoke
+test to check the actual CLI accepts our argv and returns `structured_output`:
+
+```bash
+AF_SMOKE=1 bats tests/smoke.bats
+```
+
+It costs a small amount of real API spend (haiku, capped well under $1), so
+it is not part of `bats tests/` and never runs in CI.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).

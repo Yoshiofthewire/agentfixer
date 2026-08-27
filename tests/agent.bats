@@ -13,6 +13,19 @@ setup() {
   [ "$(jq -c . "$AF_TMP/o.json")" = '{"findings":[]}' ]
 }
 
+# Regression: --disallowed-tools is variadic in the real CLI - it greedily
+# consumes every following non-flag argument. A prompt appended to argv after
+# it (the original bug: "claude ... --disallowed-tools '...' '$prompt'") is
+# swallowed as another tool name, so claude sees no prompt at all and exits 1
+# with "Input must be provided either through stdin or as a prompt argument".
+# This must fail against a pre-fix af_run_agent that puts the prompt in argv.
+@test "the prompt reaches the agent, not swallowed by variadic --disallowed-tools" {
+  stub_claude probe '{"findings":[]}'
+  run bash -c "$SRC af_run_agent probe opus 1 ro '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' 'distinctive-prompt-marker-42'"
+  [ "$status" -eq 0 ]
+  grep -q 'distinctive-prompt-marker-42' "$AF_STUB_DIR/claude/probe.args"
+}
+
 @test "read-only mode disallows write tools" {
   stub_claude probe '{}'
   bash -c "$SRC af_run_agent probe opus 1 ro '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' 'hi'"
