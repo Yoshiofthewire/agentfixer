@@ -257,6 +257,7 @@ Override the defaults with environment variables:
 | `AF_MODEL_AUDIT`, `AF_MODEL_COMBINE`, `AF_MODEL_VERIFY`, `AF_MODEL_FIX`, `AF_MODEL_CIFIX` | opus/sonnet/opus/opus/sonnet | model per step |
 | `AF_CACHE` | `~/.cache/agentfixer` | where worktrees and run logs live |
 | `AF_CI_TIMEOUT` | 1800 (seconds) | how long to wait for CI to settle |
+| `AF_CHECKS_GRACE` | 100 (seconds) | how long an empty required-check set is treated as not-yet-registered before G3 concludes the repo has none |
 | `AF_BASE` | the remote HEAD | base branch, same as `--base` |
 
 `AF_BASE` is the one setting that is *also* a flag, and `--base` simply sets

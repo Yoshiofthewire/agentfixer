@@ -914,6 +914,14 @@ AF_BUDGET_CIFIX="${AF_BUDGET_CIFIX:-3}"
 AF_CI_RETRIES="${AF_CI_RETRIES:-3}"
 AF_CI_TIMEOUT="${AF_CI_TIMEOUT:-1800}"
 AF_POLL="${AF_POLL:-15}"
+# Seconds an empty required-check set is given to resolve before it's read as
+# "this repo has no branch protection" rather than "GitHub hasn't registered
+# the checks yet". Right after `gh pr create`, `gh pr checks --required`
+# legitimately returns [] for a few seconds - verified live against
+# Busness-app/KyPost-for-Android PR #97, which does have a required check
+# ("ci-unit") and still raced empty immediately after creation. Tests set
+# this to 0 to get the old immediate-conclusion behaviour.
+AF_CHECKS_GRACE="${AF_CHECKS_GRACE:-100}"
 
 # shellcheck disable=SC2034
 read -r -d '' AF_SCHEMA_CIFIX <<'SCHEMA' || true
@@ -961,7 +969,17 @@ af_wait_ci() {
   local pr="$1" waited=0 state
   while :; do
     state="$(af_check_state "$pr")"
-    [ "$state" = "pending" ] || { printf '%s\n' "$state"; return 0; }
+    # "none" is only a genuine conclusion once it has had AF_CHECKS_GRACE
+    # seconds to resolve - see AF_CHECKS_GRACE above. Until then it's treated
+    # like "pending": the race is indistinguishable from a real pending check
+    # from here, so poll through it the same way.
+    if [ "$state" = "pending" ] \
+      || { [ "$state" = "none" ] && [ "$waited" -lt "$AF_CHECKS_GRACE" ]; }; then
+      :
+    else
+      printf '%s\n' "$state"
+      return 0
+    fi
     if [ "$waited" -ge "$AF_CI_TIMEOUT" ]; then printf 'timeout\n'; return 0; fi
     if [ "$AF_POLL" -gt 0 ]; then
       sleep "$AF_POLL"
@@ -1034,8 +1052,10 @@ af_ci_loop() {
       pass) return 0 ;;
       none)
         gh pr edit "$pr" --repo "$AF_SLUG" --add-label needs-human >/dev/null 2>&1 || true
-        af_die "G3: PR #$pr has no required checks. Enable required status
-checks in branch protection. PR left open." "$AF_EX_GATE" ;;
+        af_die "G3: no required checks appeared on PR #$pr within
+${AF_CHECKS_GRACE}s. If this repo has required status checks configured, this
+may be a slow registration after PR creation - otherwise, enable required
+status checks in branch protection. PR left open." "$AF_EX_GATE" ;;
       error*)
         gh pr edit "$pr" --repo "$AF_SLUG" --add-label needs-human >/dev/null 2>&1 || true
         af_die "G3: could not read the required checks of PR #$pr;
@@ -1099,6 +1119,12 @@ af_step_merge() {
   # and those do discover the pointer file. Nothing but bash has touched the
   # worktree since the last check; confirm that before handing it to gh.
   af_assert_worktree_git
+  # No AF_CHECKS_GRACE here, unlike af_wait_ci: af_step_merge only runs right
+  # after af_ci_loop already observed state "pass" for this same PR, which
+  # can only happen once gh has reported real required checks. A "none" here
+  # is not the gh-created-a-moment-ago race the grace period exists for; it
+  # would mean required checks vanished between that pass and this re-check,
+  # which is a reason to stop, not to wait and hope they come back.
   state="$(af_check_state "$pr")"
   case "$state" in
     pass) : ;;

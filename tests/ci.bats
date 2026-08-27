@@ -210,11 +210,41 @@ setup() {
 
 @test "no required checks halts with exit 3" {
   stub_gh "$(gh_key pr checks)" '[]'
-  run bash -c "$SRC
+  run bash -c "$SRC AF_CHECKS_GRACE=0
     af_setup_run '$REPO' alpha main >/dev/null
     af_ci_loop '$ITER' 7"
   [ "$status" -eq 3 ]
   [[ "$output" == *"no required checks"* ]]
+  grep -q 'needs-human' "$AF_STUB_DIR/gh/calls.log"
+}
+
+# BUG B - `gh pr checks --required` legitimately returns [] for a few seconds
+# right after `gh pr create`, before GitHub has registered the workflow runs.
+# Verified live against Busness-app/KyPost-for-Android PR #97, which does have
+# a required check and still raced empty right after creation. Without a
+# grace period, af_wait_ci read that as "none" and af_ci_loop killed the run
+# telling the user to enable branch protection that was already enabled.
+@test "an empty required-check set within the grace window keeps polling" {
+  stub_gh_seq "$(gh_key pr checks)" 1 '[]'
+  stub_gh_seq "$(gh_key pr checks)" 2 '[]'
+  stub_gh_seq "$(gh_key pr checks)" 3 '[{"bucket":"pending","name":"t"}]'
+  stub_gh_seq "$(gh_key pr checks)" 4 '[{"bucket":"pass","name":"t"}]'
+  run bash -c "$SRC AF_CHECKS_GRACE=10; af_wait_ci 7"
+  [ "$output" = "pass" ]
+}
+
+# The grace period is a delay, not an exemption: an empty required-check set
+# that never resolves must still trip G3 once the window elapses. AF_POLL=0
+# makes the clock advance one fake second per iteration with no real sleep.
+@test "an empty required-check set past the grace window still halts with exit 3" {
+  stub_gh "$(gh_key pr checks)" '[]'
+  run bash -c "$SRC AF_CHECKS_GRACE=3
+    af_setup_run '$REPO' alpha main >/dev/null
+    af_ci_loop '$ITER' 7"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"no required checks"* ]]
+  [[ "$output" == *"3s"* ]]
+  grep -q 'needs-human' "$AF_STUB_DIR/gh/calls.log"
 }
 
 @test "G1 trips if cifix edits a workflow" {
