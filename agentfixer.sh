@@ -312,16 +312,32 @@ af_sandbox_warn() {
 #   - Does NOT make the .git POINTER FILE unwritable: it is in the worktree,
 #     which is the read-write bind. An agent can rewrite it to name a gitdir
 #     of its own. Host-side git therefore never reads it - see af_git.
+#   - Re-exposes $HOME/.claude.json, READ-ONLY. It is a separate file at
+#     $HOME level, not inside $HOME/.claude/, so the tmpfs hides it too;
+#     without it `claude` starts with no configuration at all ("Claude
+#     configuration file not found") and every write-mode step dies. Verified
+#     against the real `claude` binary: `claude mcp list` and a live --print
+#     run both fail with that message when this bind is absent, and succeed
+#     cleanly with it present and read-only - the same reasoning as
+#     $HOME/.claude applies, it is user configuration a write-mode agent must
+#     not be able to rewrite. A fresh machine may not have the file yet, so
+#     the bind is omitted rather than emitted against a missing source,
+#     exactly like AF_GITDIR above.
 af_sandbox_prefix() {
   local -a gitdir=()
   if [ -n "${AF_GITDIR:-}" ]; then
     gitdir=(--ro-bind "$AF_GITDIR" "$AF_GITDIR")
+  fi
+  local -a claude_json=()
+  if [ -e "$HOME/.claude.json" ]; then
+    claude_json=(--ro-bind "$HOME/.claude.json" "$HOME/.claude.json")
   fi
   printf '%s\n' bwrap \
     --ro-bind / / \
     --dev /dev --proc /proc --tmpfs /tmp \
     --tmpfs "$HOME" \
     --ro-bind "$HOME/.claude" "$HOME/.claude" \
+    "${claude_json[@]}" \
     --bind "$AF_WORKTREE" "$AF_WORKTREE" \
     "${gitdir[@]}" \
     --unshare-pid --new-session --die-with-parent \

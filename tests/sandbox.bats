@@ -24,6 +24,31 @@ setup() {
   [[ "$output" != *"--bind"$'\n'"$HOME/.claude"* ]]
 }
 
+# BUG A - ~/.claude.json is a separate file at $HOME level, not inside
+# ~/.claude/, so --tmpfs "$HOME" hides it too. Without a bind for it, `claude`
+# starts with no configuration at all: verified against the real `claude`
+# binary, `claude mcp list` inside this exact bwrap invocation (minus this
+# bind) prints "Claude configuration file not found at: $HOME/.claude.json"
+# and every write-mode step dies. Read-only for the same reason ~/.claude is
+# read-only: it's user configuration a write-mode agent must not rewrite.
+@test "sandbox prefix re-exposes .claude.json read-only when it exists" {
+  echo '{}' > "$HOME/.claude.json"
+  run bash -c "$SRC AF_WORKTREE=/tmp/wt; af_sandbox_prefix"
+  [[ "$output" == *"--ro-bind"* ]]
+  [[ "$output" == *"$HOME/.claude.json"* ]]
+  [[ "$output" != *"--bind"$'\n'"$HOME/.claude.json"* ]]
+}
+
+# A fresh machine may not have ~/.claude.json yet (first-ever `claude` run).
+# Emitting a bind against a missing source makes bwrap fail outright - same
+# reasoning as the AF_GITDIR bind below.
+@test "sandbox prefix emits no .claude.json bind when the file does not exist" {
+  rm -f "$HOME/.claude.json"
+  run bash -c "$SRC AF_WORKTREE=/tmp/wt; af_sandbox_prefix"
+  [ "$status" -eq 0 ]
+  refute_grep -Fx "$HOME/.claude.json" <<<"$output"
+}
+
 # C3 - `git worktree add` leaves $AF_WORKTREE/.git a pointer file to
 # <repo>/.git/worktrees/<name>. In production that gitdir sits under $HOME,
 # which the tmpfs masks, so every git command inside the sandbox died with
@@ -70,6 +95,26 @@ setup() {
   [ "$status" -ne 0 ]
   [[ "$output" == *"POSITIVE_CONTROL_OK"* ]]
   [ ! -f "$repo/.git/hack" ]
+}
+
+# BUG A, real bwrap confinement: ~/.claude.json is readable inside the
+# sandbox (so `claude` finds its configuration) but not writable (same
+# read-only guarantee as ~/.claude itself).
+@test "CONFINEMENT: .claude.json is exposed read-only" {
+  require_bwrap
+  mkdir -p "$HOME/.claude"
+  echo '{"marker":"CLAUDE_JSON_MARKER"}' > "$HOME/.claude.json"
+  run bash -c "$SRC AF_WORKTREE='$AF_TMP/wt'
+    mkdir -p \"\$AF_WORKTREE\"
+    mapfile -t pfx < <(af_sandbox_prefix)
+    \"\${pfx[@]}\" cat '$HOME/.claude.json'
+    echo POSITIVE_CONTROL_OK
+    \"\${pfx[@]}\" bash -c \"echo hack > '$HOME/.claude.json'\""
+  debug_output
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"CLAUDE_JSON_MARKER"* ]]
+  [[ "$output" == *"POSITIVE_CONTROL_OK"* ]]
+  [ "$(cat "$HOME/.claude.json")" = '{"marker":"CLAUDE_JSON_MARKER"}' ]
 }
 
 # af_sandbox_prefix is also called directly (unit tests, and the ro path never
