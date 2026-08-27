@@ -52,7 +52,7 @@ J
 
 @test "body includes a provenance table and the run log path" {
   run bash -c "$SRC AF_RUN_DIR='$AF_TMP/run'; af_pr_body '$ITER' 1 3"
-  [[ "$output" == *"| step | model |"* ]]
+  [[ "$output" == *"| step | cli | model |"* ]]
   [[ "$output" == *"$AF_TMP/run"* ]]
   [[ "$output" == *"Generated with"* ]]
 }

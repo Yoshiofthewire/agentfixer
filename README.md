@@ -1,19 +1,28 @@
 # agentfixer
 
 Point it at a git repo. It audits the code with two independent Claude agents,
-re-verifies every finding in a fresh context, fixes the confirmed ones, has a
-fourth agent review the fix, opens a PR, drives it to green CI, and merges.
-Repeat N times.
+re-verifies every finding in a fresh context, fixes the confirmed ones, has an
+agent **from a different vendor** review the fix, opens a PR, drives it to
+green CI, and merges. Repeat N times.
 
 ```
 audit ×2 → combine → verify → fix → review ⇄ fix → pr → ci ⇄ cifix → merge
                                        (≤ AF_REVIEW_ROUNDS)  (≤ AF_CI_RETRIES)
 ```
 
-Every pipeline step is a separate `claude -p` process, so each one starts with
-a clean context and can't be talked out of what it's supposed to check. Merge
+Every pipeline step is a separate agent process, so each one starts with a
+clean context and can't be talked out of what it's supposed to check. Merge
 policy, retry caps, and tamper gates are shell conditionals — not instructions
 in a prompt an agent could be argued out of.
+
+Three CLIs drive it, and which one runs a step is a deliberate choice rather
+than a convenience:
+
+| step | CLI | why |
+|---|---|---|
+| audit, combine, verify, fix, cifix | `claude` | reads and writes the code |
+| review | `codex` (`gpt-5.5`) | must **not** share the fixer's blind spots |
+| halt-path PR body | `agy` (`gemini-3.7-flash-medium`) | writes the explanation when the Claude quota is the thing that ran out |
 
 ## Install
 
@@ -46,6 +55,22 @@ ln -s ~/git/agentfixer/agentfixer.sh ~/work/agentfixer.sh
 `--workspace DIR` overrides whichever workspace either rule would pick.
 
 Requires `claude`, `gh` (authenticated — `gh auth login`), `jq`, and `git`.
+
+`codex` (authenticated: `codex login`) is required by the fix review, which is
+on by default. Preflight refuses to start without it rather than spending an
+audit, a verification and a fix first and only then discovering the reviewer
+cannot run. It is **not** substituted for: if `codex` is missing, logged out
+or erroring, the review step fails and the run stops — a quality gate whose
+whole value is that a *different* vendor read the diff has no value at all if
+it quietly degrades to the vendor that wrote it. Set `AF_REVIEW_ROUNDS=0` if
+you genuinely want to run without a fix review; that is a decision worth
+making explicitly.
+
+`agy` (authenticated) is optional. It composes the PR body when a run is
+halted by a Claude rate limit. Without it, the halt still produces the same
+draft PR with agentfixer's own template body, and the body says which of the
+two you are reading.
+
 `fzf` is required for the interactive repo picker; `tmux` is required only
 when you select two or more repos at once. `bwrap` (bubblewrap) is required
 for every write-mode step unless you pass `--no-sandbox`.
@@ -93,12 +118,31 @@ things — the commit diff for this iteration's fixes, and the confirmed
 findings those fixes were supposed to address — and asked, per finding:
 does this diff actually fix *that* finding, and does it break anything else?
 
-It is a new `claude -p` process every round, like every other step. That
-isolation is the whole point: a reviewer that inherited the fixer's reasoning
-about its own work would be reviewing the argument, not the change. It gets
-the same `--json-schema` treatment as every other step and the same
-completeness gate (G2) — it must return exactly one verdict per finding id,
-so it cannot approve a finding by quietly dropping it.
+It is a new process every round, like every other step, **and a different
+vendor**: `codex` running `gpt-5.5`, while everything that touches the code is
+`claude`. Two things follow from that, and only the first is obvious.
+
+The isolation: a reviewer that inherited the fixer's reasoning about its own
+work would be reviewing the argument, not the change. The vendor split: Claude
+writing the fix and Claude reviewing it shares a training distribution, and so
+shares the blind spots — the same instinct that produced the fix is the one
+being asked to fault it. This is the same reasoning that already makes the
+audit stage two auditors (`security-audit` and `hostile-review`) instead of
+one, taken one stage further.
+
+It gets the same structured-output treatment as every other step and the same
+completeness gate (G2) — it must return exactly one verdict per finding id, so
+it cannot approve a finding by quietly dropping it. The schema is the same
+`AF_SCHEMA_REVIEW` the rest of the pipeline uses, translated at call time into
+the strict dialect OpenAI's structured outputs demand (every object gets
+`additionalProperties: false` and a `required` naming every one of its
+properties; a property that was optional becomes nullable so it stays
+optional). There is no second copy of the schema to drift.
+
+**The review never falls back to a Claude reviewer.** If `codex` is missing,
+unauthenticated, or errors, the step fails, the run halts, and the message
+names the remedy. `AF_REVIEW_CLI=claude` puts the review back on the fixer's
+vendor if you want that; nothing in agentfixer will choose it for you.
 
 If it objects, the objections go verbatim to a **fresh** fix agent, which
 amends the work in place. G1 (no `.github/`) and G2 (no dropped ids) run on
@@ -182,13 +226,22 @@ goes digging.
 | exit 3, review cap reached with objections | opened as a draft |
 | exit 2, CI retries exhausted, or CI timed out | the open PR is converted back to a draft (`gh pr ready --undo`) |
 | exit 3, no required checks appeared, or their state could not be read | same |
-| **exit 3, G1: an agent wrote under `.github/`** | **no PR, nothing pushed** |
+| **exit 3, G1: an agent wrote under `.github/`, before the push** | **no PR, nothing pushed** |
+| exit 3, G1 at the merge gate (content already pushed) | the open PR is converted back to a draft and labelled `needs-human` |
 
-**G1 is deliberately excluded.** G1 fires when an agent created or modified
-something under `.github/`, which is hostile or malfunctioning output.
-Publishing that content to a branch on the remote is the wrong response;
-halting with the work quarantined locally is the right one. No `gh pr create`
-runs on that path, and nothing reaches the remote.
+**G1 is deliberately excluded — before the push.** G1 fires when an agent
+created or modified something under `.github/`, which is hostile or
+malfunctioning output. Publishing that content to a branch on the remote is
+the wrong response; halting with the work quarantined locally is the right
+one. No `gh pr create` runs on that path, and nothing reaches the remote.
+
+**The merge gate's G1 is not that case.** It re-runs over the whole commit
+range after CI has gone green, and by then the content is already pushed and
+already carries an open, non-draft, unlabelled, *mergeable* pull request. "Do
+not publish it" has nothing left to protect there, and stopping on the spot
+would leave a mergeable PR full of workflow tampering one click from landing.
+So that PR is converted to a draft and labelled `needs-human` before the run
+exits 3. Nothing new is published by doing so.
 
 The halt PR's body opens with a banner stating why the run halted (including
 the upstream's own HTTP status and message), which commits are in the branch,
@@ -197,6 +250,28 @@ and that the draft is deliberate, with a checklist of what to confirm before
 marking it ready. agentfixer's ordinary report follows *underneath* the
 banner, so a body listing "Fixed" findings can never be mistaken for the
 provenance of a clean run.
+
+**On a rate-limit halt, `agy` writes the explanation.** That halt is the one
+that says nothing about the code — the work is exactly as good as it was a
+second earlier — and it is the one where a template reading "review did not
+run" is least useful. So a *third* CLI composes a plain-English "What
+happened" section for the top of the body. The second cannot: it is the
+vendor that just ran out of quota, which is why `AF_MODEL_PRBODY` defaults to
+a non-Claude model.
+
+The division is strict, and is the only reason a model is allowed near the
+body at all: **every fact in its prompt is read from this run's own JSON
+artifacts and from git** — which findings were fixed, with severity and
+location, from `confirmed.json` crossed with `fixed.json`; the halt reason
+verbatim; the gate list from the same function the template uses. The model is
+told, in as many words, that it may not add a cause, a count, a file name or a
+next step that is not in front of it. Its prose is placed *below* the warning
+banner and *above* agentfixer's own factual sections, which are still emitted
+in full. If `agy` is unavailable, unauthenticated, slow or fails, the PR is
+opened with the template body and says so by name. **A rate-limit halt always
+produces a PR.** No other halt is handed to the composer — a budget cap is an
+exact number the template already states, and a model can only make it
+vaguer.
 
 Opening the rescue PR can itself fail — the session limit that killed the run
 may still be in force. When it does, both failures are reported and the run
@@ -304,11 +379,18 @@ recommended.
   `AF_REVIEW_ROUNDS` with objections outstanding, a **draft** PR is opened and
   labelled `needs-human`, and the run halts at exit 3 — no CI, no merge, no
   next iteration.
+- Let the fixer's own vendor review the fix when the reviewer is unavailable.
+  A missing, logged-out or erroring `codex` fails the step and stops the run.
+  Silently degrading to a same-vendor reviewer would give the appearance of
+  an independent review without the substance of one.
 - Leave a mergeable PR behind after a halt. Every PR opened on a halt path is
   a draft labelled `needs-human`; a PR already open when a gate trips is
   converted back to a draft. See *Halted runs*.
-- Publish `.github/` tampering. A G1 trip opens no PR and pushes nothing —
-  the work stays quarantined in the local worktree.
+- Publish `.github/` tampering. A G1 trip before the push opens no PR and
+  pushes nothing — the work stays quarantined in the local worktree. When G1
+  trips at the merge gate, the content is already pushed, so the open PR is
+  converted to a draft and labelled `needs-human` instead of being left
+  mergeable.
 - Force push. Ever.
 - Touch your working tree. All work happens in a throwaway git worktree
   under `~/.cache/agentfixer/<repo>/<timestamp>/worktree` (override the cache
@@ -325,10 +407,10 @@ recommended.
 | 0 | completed |
 | 1 | usage error, or a preflight check failed before the run started — nothing was spent |
 | 2 | CI could not be made green (timed out, or exhausted its retries); the PR is left open, converted back to a **draft** and labelled `needs-human` |
-| 3 | a safety gate tripped mid-run: `.github/` was touched (G1), the changed-path list behind G1 could not be read at all, the fix reviewer never approved within `AF_REVIEW_ROUNDS` (G4 — a **draft** PR is opened and labelled `needs-human`, nothing merged), the PR has zero required checks (G3 — the PR is converted back to a draft and labelled `needs-human`), their state could not be read at all (G3 — a `gh` error is not evidence of anything, so it refuses), the merge-time recheck of required checks finds them not passing (G3), the merge itself was refused by GitHub, or `bwrap` is unavailable for a write-mode step and `--no-sandbox` wasn't passed |
-| 4 | an agent returned invalid, incomplete, or non-schema-conforming output — includes the verify/fix id-set mismatch (G2) and `combine` inventing non-canonical ids |
+| 3 | a safety gate tripped mid-run: `.github/` was touched (G1 — before the push, nothing is published; at the merge gate, where the content is already pushed, the open PR is converted back to a draft and labelled `needs-human`), the changed-path list behind G1 could not be read at all, the fix reviewer never approved within `AF_REVIEW_ROUNDS` (G4 — a **draft** PR is opened and labelled `needs-human`, nothing merged), the PR has zero required checks (G3 — the PR is converted back to a draft and labelled `needs-human`), their state could not be read at all (G3 — a `gh` error is not evidence of anything, so it refuses), the merge-time recheck of required checks finds them not passing (G3), the merge itself was refused by GitHub, or `bwrap` is unavailable for a write-mode step and `--no-sandbox` wasn't passed |
+| 4 | an agent returned invalid, incomplete, or non-schema-conforming output — includes the verify/fix id-set mismatch (G2), `combine` inventing non-canonical ids, and the fix reviewer's CLI being unavailable or erroring (it is never substituted for) |
 | 5 | a step hit its `--max-budget-usd` cap. Nothing is malformed — the output just wasn't finished. The message names the step, the cap, the spend, and the `AF_BUDGET_*` variable to raise (see Cost below). Work already committed is preserved as a draft PR |
-| 6 | the Claude API could not complete a call — a rate limit, a session limit, a 5xx. The message names the step, the HTTP status, and the upstream's own reason. Nothing agentfixer or the repository produced was rejected; committed work is preserved as a draft PR labelled `needs-human` (see *Halted runs*) and the run can be re-run once the limit clears |
+| 6 | an upstream API could not complete a call — a rate limit, a session limit, a 5xx, from either `claude` or the reviewer's CLI. The message names the step, the HTTP status, and the upstream's own reason. Nothing agentfixer or the repository produced was rejected; committed work is preserved as a draft PR labelled `needs-human` (see *Halted runs*) and the run can be re-run once the limit clears |
 
 Codes 2–6 can fire after real spend has already happened (audit and verify
 always run, and cost money, before the first write-mode step); code 1 never
@@ -356,19 +438,31 @@ ended this way mid-review-loop, on a 429 session limit, and both reported
 
 ## Cost
 
-Each step has a `--max-budget-usd` cap. At the defaults (2 audits × $3,
-combine $1, verify $3, fix $6, up to 3 review rounds × $3 and the 2 re-fixes
-those rounds can cost × $6, plus up to 3 cifix retries × $3), worst case is
-**$46 per repo, per iteration**.
+Each `claude` step has a `--max-budget-usd` cap. At the defaults (2 audits ×
+$3, combine $1, verify $3, fix $6, the 2 re-fixes the review rounds can cost ×
+$6, plus up to 3 cifix retries × $3), worst case is **$37 per repo, per
+iteration**.
 
-**The review stage costs at least one extra agent call per iteration**, and
-at most `AF_REVIEW_ROUNDS` reviews plus `AF_REVIEW_ROUNDS - 1` re-fixes — 3
-reviews and 2 re-fixes at the defaults, so 5 extra calls worst case, 1 in the
-common case where the first review approves. Set `AF_REVIEW_ROUNDS=0` to turn
-the stage off and get the old $25 ceiling back. The interactive confirmation screen
-multiplies that by the number of repos selected and the iteration count and
-shows the total before anything starts — but only in the interactive picker;
-see the `--repo` note above.
+**The review rounds are not in that figure**, because the figure is a sum of
+caps that are actually enforced and the default reviewer is `codex`, which has
+no spend flag to pass. Reviews are charged to your **codex quota** instead,
+uncapped: `AF_REVIEW_ROUNDS` reviews per iteration at worst, 1 in the common
+case where the first review approves. The confirmation screen states this on
+its own line rather than folding a number nobody enforces into a total it
+calls a cap. `AF_BUDGET_REVIEW` only does anything when `AF_REVIEW_CLI=claude`
+— with a `claude` reviewer the worst case is $46 again.
+
+**The re-fixes those rounds force are still `claude`,** and are in the $37.
+`AF_REVIEW_ROUNDS=0` turns the stage off entirely and brings the ceiling to
+$25. The interactive confirmation screen multiplies the total by the number of
+repos selected and the iteration count and shows it before anything starts —
+but only in the interactive picker; see the `--repo` note above.
+
+**The practical reason the split is worth having**, beyond the correlated
+blind spots: it moves the review off the constrained resource. A Claude
+session limit no longer costs a run its reviewer as well as its fixer, and a
+Claude-heavy pipeline gets its adversarial read from a quota that was sitting
+idle.
 
 **These defaults are sized for small repositories.** A real codebase gives
 its auditors and verifier more to look at, and they will run into the cap
@@ -410,12 +504,17 @@ Override the defaults with environment variables:
 | `AF_BUDGET_COMBINE` | 1 | merging the two findings lists |
 | `AF_BUDGET_VERIFY` | 3 | re-verification |
 | `AF_BUDGET_FIX` | 6 | applying fixes, and each re-fix round the reviewer forces |
-| `AF_BUDGET_REVIEW` | 3 | each review round |
+| `AF_BUDGET_REVIEW` | 3 | each review round — **only applied when `AF_REVIEW_CLI=claude`**; codex-cli has no spend cap |
 | `AF_BUDGET_CIFIX` | 3 | each CI-repair attempt |
 | `AF_BUDGET=off` | unset | disables every per-step cap outright, same as `--no-budget` |
 | `AF_CI_RETRIES` | 3 | max cifix attempts before giving up (exit 2) |
 | `AF_REVIEW_ROUNDS` | 3 | max review rounds before giving up (exit 3); `0` disables the stage |
-| `AF_MODEL_AUDIT`, `AF_MODEL_COMBINE`, `AF_MODEL_VERIFY`, `AF_MODEL_REVIEW`, `AF_MODEL_FIX`, `AF_MODEL_CIFIX` | opus/sonnet/opus/opus/opus/sonnet | model per step |
+| `AF_REVIEW_CLI` | `codex` | which CLI reviews the fix. `claude` puts the review back on the fixer's own vendor and loses the split; nothing chooses that for you |
+| `AF_PRBODY_CLI` | `agy` | which CLI composes the PR body on a rate-limit halt. If it cannot run, the bash template is used and the PR says so |
+| `AF_AGY_TIMEOUT` | `120s` | how long the halt-path composer gets before the PR is opened with the template body instead |
+| `AF_MODEL_AUDIT`, `AF_MODEL_COMBINE`, `AF_MODEL_VERIFY`, `AF_MODEL_FIX`, `AF_MODEL_CIFIX` | opus/sonnet/opus/opus/sonnet | model per `claude` step |
+| `AF_MODEL_REVIEW` | `gpt-5.5` (`opus` if `AF_REVIEW_CLI=claude`) | reviewer model |
+| `AF_MODEL_PRBODY` | `gemini-3.7-flash-medium` | halt-path composer model. Deliberately not a Claude model: it composes precisely when the Claude quota is what ran out |
 | `AF_CACHE` | `~/.cache/agentfixer` | where worktrees and run logs live |
 | `AF_CI_TIMEOUT` | 1800 (seconds) | how long to wait for CI to settle |
 | `AF_CHECKS_GRACE` | 100 (seconds) | how long an empty required-check set is treated as not-yet-registered before G3 concludes the repo has none |
@@ -434,15 +533,30 @@ bats tests/
 shellcheck agentfixer.sh tests/stubs/*
 ```
 
-Tests stub `claude` and `gh` on `PATH` and run against real temporary git
-repos. `git` is never stubbed — git behaviour is what needs proving.
+Tests stub `claude`, `codex`, `agy` and `gh` on `PATH` and run against real
+temporary git repos. `git` is never stubbed — git behaviour is what needs
+proving.
 
-The `claude` stub models the real CLI's argv parsing on the one axis
-agentfixer.sh depends on (`--disallowed-tools`/`--allowed-tools`/`--add-dir`
-are variadic and swallow whatever follows them), so an argument-ordering
-regression fails the stubbed suite too. But it is still a model, not the
-binary — nothing else here ever calls the real `claude`. Run the opt-in smoke
-test to check the actual CLI accepts our argv and returns `structured_output`:
+Each CLI stub models that CLI's real argument handling on the axes
+agentfixer.sh depends on, because a stub that accepts anything cannot catch
+the traps — and all three of these CLIs have a different one:
+
+- `claude`: `--disallowed-tools`/`--allowed-tools`/`--add-dir` are variadic
+  and swallow whatever follows them, so a prompt in argv is eaten as a tool
+  name. The prompt goes on stdin.
+- `codex`: `codex exec` blocks on stdin with no prompt, and parses a bare
+  prompt beginning `review`/`resume`/`fork`/`help` as a subcommand. The
+  positional is `-`, prompt on stdin. `--output-schema` takes a *file* in
+  OpenAI's strict dialect, and the stub reproduces the real HTTP 400 for
+  anything else. The result comes from `--output-last-message`, not from an
+  envelope field.
+- `agy`: `--print` takes an *optional* value, so `--print --output-format
+  json` silently makes `--output-format` the prompt. The stub accepts a bare
+  `--print` and takes the next word as the prompt, exactly as the real binary
+  does, so getting it wrong fails the suite.
+
+They are still models, not the binaries. Run the opt-in smoke test to check
+the actual `claude` CLI accepts our argv and returns `structured_output`:
 
 ```bash
 AF_SMOKE=1 bats tests/smoke.bats

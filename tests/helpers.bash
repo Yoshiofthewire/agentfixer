@@ -7,12 +7,13 @@ setup_stub_env() {
   AF_TMP="$(mktemp -d)"
   export AF_TMP
   export AF_STUB_DIR="$AF_TMP/stub"
-  mkdir -p "$AF_STUB_DIR/claude" "$AF_STUB_DIR/gh" "$AF_TMP/bin"
-  cp "$AF_ROOT/tests/stubs/claude" "$AF_TMP/bin/claude"
-  cp "$AF_ROOT/tests/stubs/gh" "$AF_TMP/bin/gh"
-  cp "$AF_ROOT/tests/stubs/fzf" "$AF_TMP/bin/fzf"
-  cp "$AF_ROOT/tests/stubs/tmux" "$AF_TMP/bin/tmux"
-  chmod +x "$AF_TMP/bin/claude" "$AF_TMP/bin/gh" "$AF_TMP/bin/fzf" "$AF_TMP/bin/tmux"
+  mkdir -p "$AF_STUB_DIR/claude" "$AF_STUB_DIR/gh" "$AF_STUB_DIR/codex" \
+           "$AF_STUB_DIR/agy" "$AF_TMP/bin"
+  local s
+  for s in claude gh fzf tmux codex agy; do
+    cp "$AF_ROOT/tests/stubs/$s" "$AF_TMP/bin/$s"
+    chmod +x "$AF_TMP/bin/$s"
+  done
   export PATH="$AF_TMP/bin:$PATH"
   export HOME="$AF_TMP/home"
   mkdir -p "$HOME"
@@ -44,6 +45,27 @@ stub_claude_raw() { printf '%s' "$2" > "$AF_STUB_DIR/claude/$1.envelope"; }
 
 # stub_claude_side_effect <step> <bash source>  -- runs in the agent's cwd
 stub_claude_side_effect() { printf '%s' "$2" > "$AF_STUB_DIR/claude/$1.sh"; }
+
+# stub_codex <step> <last-message-body>  -- what codex writes to -o
+stub_codex() { printf '%s' "$2" > "$AF_STUB_DIR/codex/$1.json"; }
+
+# stub_codex_fail <step> <exit code> <stderr text>
+stub_codex_fail() {
+  printf '%s' "$2" > "$AF_STUB_DIR/codex/$1.exit"
+  printf '%s\n' "$3" > "$AF_STUB_DIR/codex/$1.err"
+}
+
+# stub_codex_side_effect <step> <bash source>  -- runs in the agent's cwd
+stub_codex_side_effect() { printf '%s' "$2" > "$AF_STUB_DIR/codex/$1.sh"; }
+
+# stub_agy <step> <structured_output_json>
+stub_agy() { printf '%s' "$2" > "$AF_STUB_DIR/agy/$1.json"; }
+
+# stub_agy_fail <step> <exit code> <stderr text>
+stub_agy_fail() {
+  printf '%s' "$2" > "$AF_STUB_DIR/agy/$1.exit"
+  printf '%s\n' "$3" > "$AF_STUB_DIR/agy/$1.err"
+}
 
 # stub_gh <key> <body>   key is e.g. pr_checks, api_repos
 stub_gh() { printf '%s' "$2" > "$AF_STUB_DIR/gh/$1"; }

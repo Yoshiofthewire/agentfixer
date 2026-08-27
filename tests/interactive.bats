@@ -78,22 +78,25 @@ beta' 3 </dev/null"
 # multiplication (n repos * i iterations) is genuinely exercised rather than
 # checked against a single memorised constant that could pass by luck.
 @test "worst-case spend is the exact budget-cap sum at the real defaults" {
-  # audit 2*3, combine 1, verify 3, fix 6, review 3*3, re-fix 2*6, cifix 3*3
-  # 1 repo * 1 iteration * (6 + 1 + 3 + 6 + 9 + 12 + 9) = 46.00
+  # audit 2*3, combine 1, verify 3, fix 6, re-fix 2*6, cifix 3*3.
+  # The review rounds are absent: the default reviewer is codex, which has no
+  # --max-budget-usd to enforce AF_BUDGET_REVIEW with.
+  # 1 repo * 1 iteration * (6 + 1 + 3 + 6 + 12 + 9) = 37.00
   run bash -c "$SRC af_worst_case 1 1"
-  [ "$output" = "46.00" ]
+  [ "$output" = "37.00" ]
 }
 
 @test "worst-case spend scales exactly with repo count, iterations, and every budget knob" {
   # per instance: 2*2 + 1 + 2 + 4 + 3*3 (reviews) + 2*4 (re-fixes) + 2*1 = 30
-  # total: 2 repos * 3 iters * 30 = 180.00
-  run bash -c "$SRC AF_BUDGET_AUDIT=2 AF_BUDGET_COMBINE=1 AF_BUDGET_VERIFY=2 AF_BUDGET_FIX=4 AF_BUDGET_CIFIX=1 AF_CI_RETRIES=2
+  # total: 2 repos * 3 iters * 30 = 180.00. AF_REVIEW_CLI=claude so the
+  # review term is one this figure is actually allowed to claim.
+  run bash -c "$SRC AF_REVIEW_CLI=claude AF_BUDGET_AUDIT=2 AF_BUDGET_COMBINE=1 AF_BUDGET_VERIFY=2 AF_BUDGET_FIX=4 AF_BUDGET_CIFIX=1 AF_CI_RETRIES=2
     af_worst_case 2 3"
   [ "$output" = "180.00" ]
 }
 
 @test "the confirmation screen shows the exact worst-case figure, not just a dollar sign" {
-  run bash -c "$SRC AF_BUDGET_AUDIT=2 AF_BUDGET_COMBINE=1 AF_BUDGET_VERIFY=2 AF_BUDGET_FIX=4 AF_BUDGET_CIFIX=1 AF_CI_RETRIES=2
+  run bash -c "$SRC AF_REVIEW_CLI=claude AF_BUDGET_AUDIT=2 AF_BUDGET_COMBINE=1 AF_BUDGET_VERIFY=2 AF_BUDGET_FIX=4 AF_BUDGET_CIFIX=1 AF_CI_RETRIES=2
     af_confirm 'alpha
 beta' 3 </dev/null"
   [[ "$output" == *'$180.00'* ]]

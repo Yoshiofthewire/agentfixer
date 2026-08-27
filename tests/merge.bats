@@ -214,3 +214,37 @@ setup() {
   [[ "$output" == *"G1"* ]]
   refute_grep 'pr merge' "$AF_STUB_DIR/gh/calls.log"
 }
+
+# G1 at the merge gate is not G1 anywhere else. Everywhere earlier the content
+# is still local, and quarantining it is the whole point. Here CI has already
+# gone green against a pushed branch that has an open, non-draft, unlabelled,
+# MERGEABLE pull request on it - so refusing the merge and stopping leaves a
+# human one click from landing the tampering agentfixer just detected.
+# Nothing new is published by converting that PR to a draft and labelling it.
+@test "G1 at the merge gate converts the open PR to a draft and labels it" {
+  stub_gh "$(gh_key pr checks)" '[{"bucket":"pass","name":"t"}]'
+  run bash -c "$SRC
+    af_setup_run '$REPO' alpha main >/dev/null
+    mkdir -p \"\$AF_WORKTREE/.github/workflows\"
+    echo evil > \"\$AF_WORKTREE/.github/workflows/ci.yml\"
+    git -C \"\$AF_WORKTREE\" add -A
+    git -C \"\$AF_WORKTREE\" -c user.email=t@t -c user.name=t commit -qm sneak
+    af_step_merge 7"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"G1"* ]]
+  grep -q 'pr ready 7 --repo test/alpha --undo' "$AF_STUB_DIR/gh/calls.log"
+  grep -q -- 'pr edit 7 --repo test/alpha --add-label needs-human' "$AF_STUB_DIR/gh/calls.log"
+  # The label has to exist before it can be applied.
+  grep -q 'label create needs-human' "$AF_STUB_DIR/gh/calls.log"
+  refute_grep 'pr merge' "$AF_STUB_DIR/gh/calls.log"
+}
+
+# The inverse, so the draft conversion cannot creep onto the clean path: a
+# merge that passes G1 must leave the PR exactly as it found it.
+@test "a merge that passes G1 never touches the PR's draft state or labels" {
+  stub_gh "$(gh_key pr checks)" '[{"bucket":"pass","name":"t"}]'
+  run bash -c "$SRC $PREP; af_step_merge 7"
+  [ "$status" -eq 0 ]
+  refute_grep 'pr ready' "$AF_STUB_DIR/gh/calls.log"
+  refute_grep -- '--add-label needs-human' "$AF_STUB_DIR/gh/calls.log"
+}

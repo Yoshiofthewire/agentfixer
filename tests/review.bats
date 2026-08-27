@@ -33,26 +33,28 @@ printf "{\"results\":[{\"id\":\"%s\",\"status\":\"fixed\",\"files_changed\":[\"a
 echo patched > a.ts
 '
 
-  # One line of argv per `claude` call is appended to <step>.args, and every
-  # call carries --print, so that is the call counter. The reviewer answers
-  # for whichever finding id its own prompt embeds, exactly as the verify and
-  # fix stubs do, so the id stays right across iterations.
+  # One line of argv per call is appended to <step>.args. Every `claude` call
+  # carries --print and every `codex exec` call carries --output-schema, so
+  # those are the two call counters - the reviewer is a different CLI and
+  # shares no flag with the rest. The reviewer answers for whichever finding
+  # id its own prompt embeds, exactly as the verify and fix stubs do, so the
+  # id stays right across iterations.
   REVIEW_OK='
-p=$(grep -oE "F-[0-9]{2}-[0-9]+" "$AF_STUB_DIR/claude/review.args" | tail -1)
-printf "{\"reviews\":[{\"id\":\"%s\",\"approved\":true,\"reason\":\"fixes the finding\"}]}" "$p" > "$AF_STUB_DIR/claude/review.json"
+p=$(grep -oE "F-[0-9]{2}-[0-9]+" "$AF_STUB_DIR/codex/review.args" | tail -1)
+printf "{\"reviews\":[{\"id\":\"%s\",\"approved\":true,\"reason\":\"fixes the finding\"}]}" "$p" > "$AF_STUB_DIR/codex/review.json"
 '
   REVIEW_NEVER='
-p=$(grep -oE "F-[0-9]{2}-[0-9]+" "$AF_STUB_DIR/claude/review.args" | tail -1)
-printf "{\"reviews\":[{\"id\":\"%s\",\"approved\":false,\"reason\":\"no\",\"objection\":\"OBJECTION-MARKER the null check is still missing\"}]}" "$p" > "$AF_STUB_DIR/claude/review.json"
+p=$(grep -oE "F-[0-9]{2}-[0-9]+" "$AF_STUB_DIR/codex/review.args" | tail -1)
+printf "{\"reviews\":[{\"id\":\"%s\",\"approved\":false,\"reason\":\"no\",\"objection\":\"OBJECTION-MARKER the null check is still missing\"}]}" "$p" > "$AF_STUB_DIR/codex/review.json"
 '
   # Objects on the FIRST call of the run only; approves from the second on.
   REVIEW_ONCE='
-n=$(grep -c -- "--print" "$AF_STUB_DIR/claude/review.args")
-p=$(grep -oE "F-[0-9]{2}-[0-9]+" "$AF_STUB_DIR/claude/review.args" | tail -1)
+n=$(grep -c -- "--output-schema" "$AF_STUB_DIR/codex/review.args")
+p=$(grep -oE "F-[0-9]{2}-[0-9]+" "$AF_STUB_DIR/codex/review.args" | tail -1)
 if [ "$n" -ge 2 ]; then
-  printf "{\"reviews\":[{\"id\":\"%s\",\"approved\":true,\"reason\":\"now correct\"}]}" "$p" > "$AF_STUB_DIR/claude/review.json"
+  printf "{\"reviews\":[{\"id\":\"%s\",\"approved\":true,\"reason\":\"now correct\"}]}" "$p" > "$AF_STUB_DIR/codex/review.json"
 else
-  printf "{\"reviews\":[{\"id\":\"%s\",\"approved\":false,\"reason\":\"no\",\"objection\":\"OBJECTION-MARKER the null check is missing\"}]}" "$p" > "$AF_STUB_DIR/claude/review.json"
+  printf "{\"reviews\":[{\"id\":\"%s\",\"approved\":false,\"reason\":\"no\",\"objection\":\"OBJECTION-MARKER the null check is missing\"}]}" "$p" > "$AF_STUB_DIR/codex/review.json"
 fi
 '
   REFIX_OK='
@@ -68,41 +70,46 @@ agent_calls() {
   grep -c -- '--print' "$AF_STUB_DIR/claude/$1.args" 2>/dev/null || echo 0
 }
 
+review_calls() {
+  grep -c -- '--output-schema' "$AF_STUB_DIR/codex/review.args" 2>/dev/null || echo 0
+}
+
 pr_body() { cat "$AF_TMP"/cache/alpha/*/"$1"/pr-body.md; }
 
 # --------------------------------------------------------------- fast path
 
 @test "an approval on round 1 costs exactly one review call and no re-fix" {
-  stub_claude_side_effect review "$REVIEW_OK"
+  stub_codex_side_effect review "$REVIEW_OK"
   run bash -c "$SRC af_run_repo '$REPO' alpha 1"
   debug_output
   [ "$status" -eq 0 ]
-  [ "$(agent_calls review)" -eq 1 ]
+  [ "$(review_calls)" -eq 1 ]
   [ ! -f "$AF_STUB_DIR/claude/refix.args" ]
   grep -q 'pr merge 7' "$AF_STUB_DIR/gh/calls.log"
 }
 
 @test "the review step is read-only and never sandboxed into write mode" {
-  stub_claude_side_effect review "$REVIEW_OK"
+  stub_codex_side_effect review "$REVIEW_OK"
   run bash -c "$SRC af_run_repo '$REPO' alpha 1"
   [ "$status" -eq 0 ]
-  refute_grep 'bypassPermissions' "$AF_STUB_DIR/claude/review.args"
-  grep -q -- 'Edit Write' "$AF_STUB_DIR/claude/review.args"
+  grep -q -- '--sandbox read-only' "$AF_STUB_DIR/codex/review.args"
+  refute_grep 'danger' "$AF_STUB_DIR/codex/review.args"
+  refute_grep 'bypassPermissions' "$AF_STUB_DIR/codex/review.args"
 }
 
 # The verdict has to be anchored to the finding it claims to address, so the
 # prompt must carry both the finding record and the actual committed diff.
 @test "the review prompt carries the commit diff and the confirmed findings" {
-  stub_claude_side_effect review "$REVIEW_OK"
+  stub_codex_side_effect review "$REVIEW_OK"
   run bash -c "$SRC af_run_repo '$REPO' alpha 1"
   [ "$status" -eq 0 ]
-  grep -q 'F-01-1' "$AF_STUB_DIR/claude/review.args"
-  grep -q 'diff --git' "$AF_STUB_DIR/claude/review.args"
-  grep -q '^+patched' "$AF_STUB_DIR/claude/review.args"
+  grep -q 'F-01-1' "$AF_STUB_DIR/codex/review.args"
+  grep -q 'diff --git' "$AF_STUB_DIR/codex/review.args"
+  grep -q '^+patched' "$AF_STUB_DIR/codex/review.args"
 }
 
 @test "a first-round approval is recorded in the PR body" {
-  stub_claude_side_effect review "$REVIEW_OK"
+  stub_codex_side_effect review "$REVIEW_OK"
   run bash -c "$SRC af_run_repo '$REPO' alpha 1"
   [ "$status" -eq 0 ]
   run pr_body iter-01
@@ -113,18 +120,18 @@ pr_body() { cat "$AF_TMP"/cache/alpha/*/"$1"/pr-body.md; }
 # ------------------------------------------------------- object, then clear
 
 @test "one objection sends the work back to the fix step and then proceeds" {
-  stub_claude_side_effect review "$REVIEW_ONCE"
+  stub_codex_side_effect review "$REVIEW_ONCE"
   stub_claude_side_effect refix "$REFIX_OK"
   run bash -c "$SRC af_run_repo '$REPO' alpha 1"
   debug_output
   [ "$status" -eq 0 ]
-  [ "$(agent_calls review)" -eq 2 ]
+  [ "$(review_calls)" -eq 2 ]
   [ "$(agent_calls refix)" -eq 1 ]
   grep -q 'pr merge 7' "$AF_STUB_DIR/gh/calls.log"
 }
 
 @test "the re-fix agent is given the reviewer's specific objection" {
-  stub_claude_side_effect review "$REVIEW_ONCE"
+  stub_codex_side_effect review "$REVIEW_ONCE"
   stub_claude_side_effect refix "$REFIX_OK"
   run bash -c "$SRC af_run_repo '$REPO' alpha 1"
   [ "$status" -eq 0 ]
@@ -135,7 +142,7 @@ pr_body() { cat "$AF_TMP"/cache/alpha/*/"$1"/pr-body.md; }
 # verification: which findings were hard is information a human reviewer of
 # the PR wants, and it is lost the moment the objection is resolved.
 @test "objections resolved in a later round still reach the PR body" {
-  stub_claude_side_effect review "$REVIEW_ONCE"
+  stub_codex_side_effect review "$REVIEW_ONCE"
   stub_claude_side_effect refix "$REFIX_OK"
   run bash -c "$SRC af_run_repo '$REPO' alpha 1"
   [ "$status" -eq 0 ]
@@ -147,7 +154,7 @@ pr_body() { cat "$AF_TMP"/cache/alpha/*/"$1"/pr-body.md; }
 @test "the re-fix round's work is a second commit on the same branch" {
   # No branch deletion on merge, so the pushed ref survives for inspection.
   stub_gh_side_effect "$(gh_key pr merge)" ':'
-  stub_claude_side_effect review "$REVIEW_ONCE"
+  stub_codex_side_effect review "$REVIEW_ONCE"
   stub_claude_side_effect refix "$REFIX_OK"
   run bash -c "$SRC af_run_repo '$REPO' alpha 1"
   debug_output
@@ -168,7 +175,7 @@ pr_body() { cat "$AF_TMP"/cache/alpha/*/"$1"/pr-body.md; }
 # G1 has to hold on the AMENDED work exactly as it does on the first pass -
 # a re-fix agent can reach for .github/ just as readily as a fix agent.
 @test "G1 trips when the re-fix agent edits a workflow" {
-  stub_claude_side_effect review "$REVIEW_NEVER"
+  stub_codex_side_effect review "$REVIEW_NEVER"
   stub_claude_side_effect refix "$REFIX_OK"'
 mkdir -p .github/workflows && echo evil > .github/workflows/ci.yml
 '
@@ -179,7 +186,7 @@ mkdir -p .github/workflows && echo evil > .github/workflows/ci.yml
 }
 
 @test "G2 holds on the re-fix agent's output" {
-  stub_claude_side_effect review "$REVIEW_NEVER"
+  stub_codex_side_effect review "$REVIEW_NEVER"
   stub_claude_side_effect refix 'printf "{\"results\":[]}" > "$AF_STUB_DIR/claude/refix.json"'
   run bash -c "$SRC af_run_repo '$REPO' alpha 1"
   [ "$status" -eq 4 ]
@@ -189,12 +196,12 @@ mkdir -p .github/workflows && echo evil > .github/workflows/ci.yml
 # ------------------------------------------------------------- cap reached
 
 @test "objections at the cap open a PR, label it needs-human, and never merge" {
-  stub_claude_side_effect review "$REVIEW_NEVER"
+  stub_codex_side_effect review "$REVIEW_NEVER"
   stub_claude_side_effect refix "$REFIX_OK"
   run bash -c "$SRC AF_REVIEW_ROUNDS=2; af_run_repo '$REPO' alpha 2"
   debug_output
   [ "$status" -eq 3 ]
-  [ "$(agent_calls review)" -eq 2 ]
+  [ "$(review_calls)" -eq 2 ]
   [ "$(agent_calls refix)" -eq 1 ]
   grep -q 'pr create' "$AF_STUB_DIR/gh/calls.log"
   grep -q -- '--add-label needs-human' "$AF_STUB_DIR/gh/calls.log"
@@ -207,7 +214,7 @@ mkdir -p .github/workflows && echo evil > .github/workflows/ci.yml
 # never approved must not be one click from merging. Asserted on the flag that
 # actually reached `gh pr create`, not on the PR body.
 @test "the PR opened at the review cap is a draft" {
-  stub_claude_side_effect review "$REVIEW_NEVER"
+  stub_codex_side_effect review "$REVIEW_NEVER"
   stub_claude_side_effect refix "$REFIX_OK"
   run bash -c "$SRC AF_REVIEW_ROUNDS=2; af_run_repo '$REPO' alpha 1"
   debug_output
@@ -219,7 +226,7 @@ mkdir -p .github/workflows && echo evil > .github/workflows/ci.yml
 # A body whose "Fixed" list reads exactly like a clean run's would pass work
 # the reviewer refused off as reviewed. The halt has to be visible at the top.
 @test "the review-cap PR body opens with the halt banner, not the normal report" {
-  stub_claude_side_effect review "$REVIEW_NEVER"
+  stub_codex_side_effect review "$REVIEW_NEVER"
   stub_claude_side_effect refix "$REFIX_OK"
   run bash -c "$SRC AF_REVIEW_ROUNDS=2; af_run_repo '$REPO' alpha 1"
   [ "$status" -eq 3 ]
@@ -235,7 +242,7 @@ mkdir -p .github/workflows && echo evil > .github/workflows/ci.yml
 }
 
 @test "the branch is pushed when the cap is reached, so the PR has content" {
-  stub_claude_side_effect review "$REVIEW_NEVER"
+  stub_codex_side_effect review "$REVIEW_NEVER"
   stub_claude_side_effect refix "$REFIX_OK"
   run bash -c "$SRC AF_REVIEW_ROUNDS=2; af_run_repo '$REPO' alpha 1"
   [ "$status" -eq 3 ]
@@ -244,7 +251,7 @@ mkdir -p .github/workflows && echo evil > .github/workflows/ci.yml
 }
 
 @test "unresolved objections are written into the PR body under a clear heading" {
-  stub_claude_side_effect review "$REVIEW_NEVER"
+  stub_codex_side_effect review "$REVIEW_NEVER"
   stub_claude_side_effect refix "$REFIX_OK"
   run bash -c "$SRC AF_REVIEW_ROUNDS=2; af_run_repo '$REPO' alpha 1"
   [ "$status" -eq 3 ]
@@ -258,7 +265,7 @@ mkdir -p .github/workflows && echo evil > .github/workflows/ci.yml
 # ---------------------------------------------------------------- G2 on review
 
 @test "G2: a reviewer that drops a finding exits 4" {
-  stub_claude review '{"reviews":[{"id":"F-01-1","approved":true,"reason":"r"}]}'
+  stub_codex review '{"reviews":[{"id":"F-01-1","approved":true,"reason":"r"}]}'
   cat > "$ITER/confirmed.json" <<'J'
 [{"id":"F-01-1","severity":"HIGH","file":"a.ts","line":1,"title":"t1","blurb":"b","detail":"d","evidence":"e"},
  {"id":"F-01-2","severity":"LOW","file":"b.ts","line":2,"title":"t2","blurb":"b","detail":"d","evidence":"e"}]
@@ -271,7 +278,7 @@ J
 }
 
 @test "G2: a reviewer that invents a finding id exits 4" {
-  stub_claude review '{"reviews":[{"id":"F-01-1","approved":true,"reason":"r"},{"id":"F-01-9","approved":true,"reason":"r"}]}'
+  stub_codex review '{"reviews":[{"id":"F-01-1","approved":true,"reason":"r"},{"id":"F-01-9","approved":true,"reason":"r"}]}'
   cat > "$ITER/confirmed.json" <<'J'
 [{"id":"F-01-1","severity":"HIGH","file":"a.ts","line":1,"title":"t1","blurb":"b","detail":"d","evidence":"e"}]
 J
@@ -287,11 +294,11 @@ J
 # 0 means "do not review", not "review once": any other reading makes 0 a
 # synonym for 1, which is a lie the README would then have to tell.
 @test "AF_REVIEW_ROUNDS=0 disables the stage entirely and still merges" {
-  stub_claude_side_effect review "$REVIEW_NEVER"
+  stub_codex_side_effect review "$REVIEW_NEVER"
   run bash -c "$SRC AF_REVIEW_ROUNDS=0; af_run_repo '$REPO' alpha 1"
   debug_output
   [ "$status" -eq 0 ]
-  [ ! -f "$AF_STUB_DIR/claude/review.args" ]
+  [ ! -f "$AF_STUB_DIR/codex/review.args" ]
   [ ! -f "$AF_STUB_DIR/claude/refix.args" ]
   grep -q 'pr merge 7' "$AF_STUB_DIR/gh/calls.log"
   run pr_body iter-01
@@ -299,27 +306,27 @@ J
 }
 
 @test "AF_REVIEW_ROUNDS=1 reviews once and never re-fixes" {
-  stub_claude_side_effect review "$REVIEW_NEVER"
+  stub_codex_side_effect review "$REVIEW_NEVER"
   stub_claude_side_effect refix "$REFIX_OK"
   run bash -c "$SRC AF_REVIEW_ROUNDS=1; af_run_repo '$REPO' alpha 1"
   debug_output
   [ "$status" -eq 3 ]
-  [ "$(agent_calls review)" -eq 1 ]
+  [ "$(review_calls)" -eq 1 ]
   [ ! -f "$AF_STUB_DIR/claude/refix.args" ]
   grep -q -- '--add-label needs-human' "$AF_STUB_DIR/gh/calls.log"
   refute_grep 'pr merge' "$AF_STUB_DIR/gh/calls.log"
 }
 
 @test "AF_REVIEW_ROUNDS=1 with an approval merges normally" {
-  stub_claude_side_effect review "$REVIEW_OK"
+  stub_codex_side_effect review "$REVIEW_OK"
   run bash -c "$SRC AF_REVIEW_ROUNDS=1; af_run_repo '$REPO' alpha 1"
   [ "$status" -eq 0 ]
-  [ "$(agent_calls review)" -eq 1 ]
+  [ "$(review_calls)" -eq 1 ]
   grep -q 'pr merge 7' "$AF_STUB_DIR/gh/calls.log"
 }
 
 @test "a non-numeric AF_REVIEW_ROUNDS is rejected, not silently treated as 1" {
-  stub_claude_side_effect review "$REVIEW_OK"
+  stub_codex_side_effect review "$REVIEW_OK"
   run bash -c "$SRC AF_REVIEW_ROUNDS=lots; af_run_repo '$REPO' alpha 1"
   [ "$status" -eq 1 ]
   [[ "$output" == *"AF_REVIEW_ROUNDS"* ]]
@@ -331,7 +338,7 @@ J
 # working-tree scratch nor the previous iteration's objection history.
 @test "a hot review loop leaves nothing for the next iteration" {
   stub_gh_side_effect "$(gh_key pr merge)" ':'
-  stub_claude_side_effect review "$REVIEW_ONCE"
+  stub_codex_side_effect review "$REVIEW_ONCE"
   stub_claude_side_effect refix "$REFIX_OK"'
 echo stray > stray-r1.txt
 '
@@ -339,7 +346,7 @@ echo stray > stray-r1.txt
   debug_output
   [ "$status" -eq 0 ]
   # Iteration 1: one objection, one re-fix. Iteration 2: clean first round.
-  [ "$(agent_calls review)" -eq 3 ]
+  [ "$(review_calls)" -eq 3 ]
   [ "$(agent_calls refix)" -eq 1 ]
   # Iteration 2's PR body reports a first-round approval, with none of
   # iteration 1's objection history bleeding into it.
@@ -360,9 +367,22 @@ echo stray > stray-r1.txt
 @test "worst-case spend accounts for the review rounds and their re-fixes" {
   # per instance: 2*2 + 1 + 2 + 4 (fix) + 2*1 (cifix)
   #             + 2*3 (2 reviews) + 1*4 (1 re-fix) = 23
-  run bash -c "$SRC AF_BUDGET_AUDIT=2 AF_BUDGET_COMBINE=1 AF_BUDGET_VERIFY=2 AF_BUDGET_FIX=4 AF_BUDGET_CIFIX=1 AF_CI_RETRIES=2 AF_BUDGET_REVIEW=3 AF_REVIEW_ROUNDS=2
+  run bash -c "$SRC AF_REVIEW_CLI=claude AF_BUDGET_AUDIT=2 AF_BUDGET_COMBINE=1 AF_BUDGET_VERIFY=2 AF_BUDGET_FIX=4 AF_BUDGET_CIFIX=1 AF_CI_RETRIES=2 AF_BUDGET_REVIEW=3 AF_REVIEW_ROUNDS=2
     af_worst_case 1 1"
   [ "$output" = "23.00" ]
+}
+
+# The confirmation screen calls this figure a cap rather than an estimate,
+# and the only thing that makes that true is that every term is a
+# --max-budget-usd actually passed to `claude`. codex-cli has no spend flag
+# to pass, so AF_BUDGET_REVIEW is never enforced against a codex reviewer and
+# must not be summed as though it were. The re-fixes stay: they are `claude`
+# whatever the reviewer is.
+@test "review rounds leave the Claude worst case when the reviewer is another vendor" {
+  # Same knobs as above, minus the 2*3 of reviews nobody caps: 23 - 6 = 17.
+  run bash -c "$SRC AF_REVIEW_CLI=codex AF_BUDGET_AUDIT=2 AF_BUDGET_COMBINE=1 AF_BUDGET_VERIFY=2 AF_BUDGET_FIX=4 AF_BUDGET_CIFIX=1 AF_CI_RETRIES=2 AF_BUDGET_REVIEW=3 AF_REVIEW_ROUNDS=2
+    af_worst_case 1 1"
+  [ "$output" = "17.00" ]
 }
 
 # The README states both of these figures outright, and its accuracy is a
@@ -370,7 +390,7 @@ echo stray > stray-r1.txt
 # an estimate.
 @test "the README's worst-case figures are the ones af_worst_case computes" {
   run bash -c "$SRC af_worst_case 1 1"
-  [ "$output" = "46.00" ]
+  [ "$output" = "37.00" ]
   run bash -c "$SRC AF_REVIEW_ROUNDS=0; af_worst_case 1 1"
   [ "$output" = "25.00" ]
 }
@@ -401,7 +421,7 @@ echo stray > stray-r1.txt
 }
 
 @test "the PR provenance table names the review model" {
-  stub_claude_side_effect review "$REVIEW_OK"
+  stub_codex_side_effect review "$REVIEW_OK"
   run bash -c "$SRC af_run_repo '$REPO' alpha 1"
   [ "$status" -eq 0 ]
   run pr_body iter-01
@@ -570,12 +590,12 @@ echo patched > b.ts
   # Answers for exactly the ids the prompt asks about, rejecting any listed
   # in the `reject` file. The scope of every call is appended to
   # review.scopes so a test can assert what round 2 was actually asked.
-  stub_claude_side_effect review '
-ids=$(tac "$AF_STUB_DIR/claude/review.args" \
+  stub_codex_side_effect review '
+ids=$(tac "$AF_STUB_DIR/codex/review.args" \
   | sed -n "1,/^Answer for exactly these finding ids/p" \
   | grep -oE "F-[0-9]{2}-[0-9]+" | sort -u)
-printf "%s\n" "$ids" | tr "\n" " " >> "$AF_STUB_DIR/claude/review.scopes"
-printf "\n" >> "$AF_STUB_DIR/claude/review.scopes"
+printf "%s\n" "$ids" | tr "\n" " " >> "$AF_STUB_DIR/codex/review.scopes"
+printf "\n" >> "$AF_STUB_DIR/codex/review.scopes"
 {
 printf "{\"reviews\":["
 sep=""
@@ -588,7 +608,7 @@ for i in $ids; do
   sep=","
 done
 printf "]}"
-} > "$AF_STUB_DIR/claude/review.json"
+} > "$AF_STUB_DIR/codex/review.json"
 '
 }
 
@@ -605,7 +625,7 @@ $clear
 "
 }
 
-review_scopes() { cat "$AF_STUB_DIR/claude/review.scopes"; }
+review_scopes() { cat "$AF_STUB_DIR/codex/review.scopes"; }
 review_json() { cat "$AF_TMP"/cache/alpha/*/iter-01/"review-$1.json"; }
 
 @test "a finding approved in round 1 is not re-litigated in round 2" {
@@ -615,7 +635,7 @@ review_json() { cat "$AF_TMP"/cache/alpha/*/iter-01/"review-$1.json"; }
   run bash -c "$SRC af_run_repo '$REPO' alpha 1"
   debug_output
   [ "$status" -eq 0 ]
-  [ "$(agent_calls review)" -eq 2 ]
+  [ "$(review_calls)" -eq 2 ]
   run review_scopes
   [ "${lines[0]}" = "F-01-1 F-01-2 " ]
   [ "${lines[1]}" = "F-01-2 " ]
@@ -660,7 +680,7 @@ review_json() { cat "$AF_TMP"/cache/alpha/*/iter-01/"review-$1.json"; }
   run bash -c "$SRC AF_REVIEW_ROUNDS=2; af_run_repo '$REPO' alpha 1"
   debug_output
   [ "$status" -eq 3 ]
-  [ "$(agent_calls review)" -eq 2 ]
+  [ "$(review_calls)" -eq 2 ]
   run review_scopes
   [ "${lines[1]}" = "F-01-2 " ]
   grep -q -- '--add-label needs-human' "$AF_STUB_DIR/gh/calls.log"
@@ -674,11 +694,68 @@ review_json() { cat "$AF_TMP"/cache/alpha/*/iter-01/"review-$1.json"; }
   printf 'F-01-2\n' > "$AF_STUB_DIR/claude/reject"
   refix_touching b.ts
   stub_claude_side_effect refix "$(cat "$AF_STUB_DIR/claude/refix.sh")"'
-printf "{\"reviews\":[]}" > "$AF_STUB_DIR/claude/review.json"
-rm -f "$AF_STUB_DIR/claude/review.sh"
+printf "{\"reviews\":[]}" > "$AF_STUB_DIR/codex/review.json"
+rm -f "$AF_STUB_DIR/codex/review.sh"
 '
   run bash -c "$SRC af_run_repo '$REPO' alpha 1"
   debug_output
   [ "$status" -eq 4 ]
   [[ "$output" == *"G2"* ]]
+}
+
+# ------------------------------------------------------- the vendor split
+
+# The reason this stage exists at all is that the reviewer did not write the
+# diff. Claude writing the fix and Claude reviewing it shares a training
+# distribution and so shares the blind spots. A run in which `claude` was
+# asked to review its own fix has lost the property the stage is named for,
+# and no assertion about the verdict would notice.
+@test "the fix reviewer is a different CLI from the fixer" {
+  stub_codex_side_effect review "$REVIEW_OK"
+  run bash -c "$SRC af_run_repo '$REPO' alpha 1"
+  [ "$status" -eq 0 ]
+  [ "$(review_calls)" -eq 1 ]
+  # The fixer ran, on claude...
+  grep -q -- '--print' "$AF_STUB_DIR/claude/fix.args"
+  # ...and claude was never asked to review its own work.
+  refute_grep . "$AF_STUB_DIR/claude/review.args"
+}
+
+@test "the PR body records which vendor reviewed, not just which model" {
+  stub_codex_side_effect review "$REVIEW_OK"
+  run bash -c "$SRC af_run_repo '$REPO' alpha 1"
+  [ "$status" -eq 0 ]
+  run pr_body iter-01
+  [[ "$output" == *"| review | codex | gpt-5.5 |"* ]]
+  [[ "$output" == *"a different vendor"* ]]
+}
+
+# The knob exists, and the point of it is that it is not the default. If
+# AF_REVIEW_CLI stopped being read, the split would silently disappear while
+# every other test in this file still passed.
+@test "AF_REVIEW_CLI selects the reviewer, and codex is the default" {
+  stub_claude_side_effect review '
+p=$(grep -oE "F-[0-9]{2}-[0-9]+" "$AF_STUB_DIR/claude/review.args" | tail -1)
+printf "{\"reviews\":[{\"id\":\"%s\",\"approved\":true,\"reason\":\"ok\"}]}" "$p" > "$AF_STUB_DIR/claude/review.json"
+'
+  run bash -c "AF_REVIEW_CLI=claude; $SRC af_run_repo '$REPO' alpha 1"
+  debug_output
+  [ "$status" -eq 0 ]
+  [ "$(review_calls)" -eq 0 ]
+  grep -q -- '--print' "$AF_STUB_DIR/claude/review.args"
+  run pr_body iter-01
+  [[ "$output" == *"| review | claude | opus |"* ]]
+}
+
+# A reviewer that cannot run must stop the run. Falling back to `claude` would
+# leave every downstream assertion - the PR body's "reviewed by an independent
+# reviewer" included - true in form and false in substance.
+@test "a reviewer that cannot run halts the run instead of falling back" {
+  stub_codex_fail review 127 "codex: command not found"
+  run bash -c "$SRC af_run_repo '$REPO' alpha 1"
+  debug_output
+  [ "$status" -eq 4 ]
+  [[ "$output" == *"codex"* ]]
+  refute_grep . "$AF_STUB_DIR/claude/review.args"
+  refute_grep 'pr create' "$AF_STUB_DIR/gh/calls.log"
 }

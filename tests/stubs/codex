@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Programmable `codex` stub. Dispatches on $AF_STEP.
+#
+# Models codex-cli 0.149.1's argument handling on every axis agentfixer.sh
+# depends on, so this stub can catch the traps rather than agree with
+# whatever the caller assumed:
+#   - `codex exec` is a subcommand, not a flag.
+#   - the prompt is a POSITIONAL. "-" means "read it from stdin"; anything
+#     else is the prompt itself, and review/resume/fork/help in that position
+#     is a subcommand instead.
+#   - with no positional at all the real binary blocks on a terminal stdin.
+#     Here that is a hard error, so a hang shows up as a failing test.
+#   - --output-schema takes a FILE PATH, and the file must be in OpenAI's
+#     strict dialect: every object needs additionalProperties false and a
+#     "required" naming every one of its properties. Anything else is the
+#     real HTTP 400 (invalid_json_schema), reproduced as exit 1.
+#   - the result goes to --output-last-message's FILE, never to a
+#     .structured_output field in an envelope.
+set -euo pipefail
+step="${AF_STEP:-unknown}"
+d="${AF_STUB_DIR:?AF_STUB_DIR unset}/codex"
+mkdir -p "$d"
+
+[ "${1:-}" = "exec" ] || { echo "codex: unexpected subcommand '${1:-}'" >&2; exit 2; }
+shift
+
+schema="" lastmsg="" positional="" want=""
+for a in "$@"; do
+  case "$want" in
+    schema) schema="$a"; want=""; continue ;;
+    lastmsg) lastmsg="$a"; want=""; continue ;;
+    skip) want=""; continue ;;
+  esac
+  case "$a" in
+    --output-schema) want=schema ;;
+    -o|--output-last-message) want=lastmsg ;;
+    -m|--model|-s|--sandbox|-c|--config|-p|--profile|-C|--cd|--add-dir) want=skip ;;
+    -) [ -n "$positional" ] || positional="-" ;;
+    --*|-?*) : ;;
+    *) [ -n "$positional" ] || positional="$a" ;;
+  esac
+done
+
+stdin_data=""
+if [ ! -t 0 ]; then stdin_data="$(cat)"; fi
+
+case "$positional" in
+  review|resume|fork|help)
+    echo "codex: '$positional' parsed as a subcommand, not a prompt" >&2; exit 2 ;;
+  "")
+    echo "codex: no prompt given; the real binary blocks here waiting on stdin" >&2
+    exit 2 ;;
+  -)
+    [ -n "$stdin_data" ] || { echo "codex: '-' given but stdin was empty" >&2; exit 2; }
+    prompt="$stdin_data" ;;
+  *) prompt="$positional" ;;
+esac
+
+[ -n "$schema" ] || { echo "codex: this stub requires --output-schema" >&2; exit 2; }
+[ -f "$schema" ] || { echo "codex: --output-schema takes a file path, got '$schema'" >&2; exit 2; }
+[ -n "$lastmsg" ] || { echo "codex: this stub requires --output-last-message" >&2; exit 2; }
+
+# The strict-dialect check, reported the way a real 400 is.
+if ! jq -e '
+  def ok:
+    if type == "object" then
+      ( if .type == "object" and (.properties | type) == "object" then
+          (.additionalProperties == false)
+          and (((.required // []) | sort) == (.properties | keys | sort))
+        else true end)
+      and ([ .[] | ok ] | all)
+    elif type == "array" then ([ .[] | ok ] | all)
+    else true end;
+  ok' "$schema" >/dev/null 2>&1; then
+  echo "codex: 400 invalid_json_schema: every object needs additionalProperties false and a required naming every key in properties" >&2
+  exit 1
+fi
+
+printf '%s\n' "$*" >> "$d/$step.args"
+printf '%s\n' "$prompt" >> "$d/$step.args"
+
+# Optional side effect, executed in the caller's cwd (the worktree).
+if [ -f "$d/$step.sh" ]; then
+  bash "$d/$step.sh"
+fi
+
+rc=0
+if [ -f "$d/$step.exit" ]; then rc="$(cat "$d/$step.exit")"; fi
+if [ -f "$d/$step.err" ]; then cat "$d/$step.err" >&2; fi
+if [ "$rc" != "0" ]; then exit "$rc"; fi
+
+if [ -f "$d/$step.json" ]; then
+  cat "$d/$step.json" > "$lastmsg"
+  cat "$d/$step.json"
+fi
+exit 0

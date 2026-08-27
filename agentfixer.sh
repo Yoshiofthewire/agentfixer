@@ -256,6 +256,19 @@ af_preflight() {
   for c in claude gh jq git; do
     command -v "$c" >/dev/null || af_die "missing dependency: $c" "$AF_EX_USAGE"
   done
+  # The reviewer runs several dollars into the pipeline, after audit, verify
+  # and fix have all been paid for. `command -v` here is not the capability
+  # check - af_vendor_codex trying and failing is, and it never falls back -
+  # it just moves the commonest failure (not installed) to before the spend
+  # rather than after it. Skipped when the stage is off, so AF_REVIEW_ROUNDS=0
+  # does not require a CLI it will never call.
+  if [ "${AF_REVIEW_ROUNDS:-3}" != "0" ]; then
+    command -v "$AF_REVIEW_CLI" >/dev/null || af_die \
+      "missing dependency: $AF_REVIEW_CLI, which agentfixer reviews fixes with.
+The fix reviewer is deliberately a different vendor from the fixer, so this is
+not something agentfixer will substitute a Claude reviewer for. Install it, or
+set AF_REVIEW_ROUNDS=0 to run with no fix review at all." "$AF_EX_USAGE"
+  fi
   gh auth status >/dev/null 2>&1 || af_die "gh is not authenticated; run: gh auth login" "$AF_EX_USAGE"
 
   slug="$(af_repo_slug "$dir")" \
@@ -360,13 +373,50 @@ af_sandbox_prefix() {
 
 # ------------------------------------------------------------ agent wrapper
 
-# af_run_agent STEP MODEL BUDGET MODE SCHEMA OUT LOG PROMPT
+# af_run_agent STEP MODEL BUDGET MODE SCHEMA OUT LOG PROMPT [CLI]
 # MODE is "ro" (read-only) or "rw" (write, bypassPermissions, sandboxed).
-# Writes .structured_output to OUT, the raw envelope to LOG.
+# CLI defaults to "claude"; see the vendor functions below.
+#
+# Three CLIs drive this tool and no two of them pass a prompt, take a schema,
+# or return a result the same way. Each af_vendor_* function owns exactly
+# those three things plus how that CLI reports failure and cost. This
+# function owns the one contract all three must meet, and which nothing
+# downstream re-checks: OUT holds schema-valid structured output, or the step
+# died. There is deliberately no registry, no plugin lookup and no fallback
+# vendor - a reviewer that silently became the same vendor as the fixer would
+# look independent without being it.
 af_run_agent() {
+  local step="$1" cli="${9:-claude}"
+  : "${AF_RUN_DIR:?internal error: agent invoked before af_setup_run}"
+  case "$cli" in
+    claude) af_vendor_claude "$@" ;;
+    codex)  af_vendor_codex "$@" ;;
+    agy)    af_vendor_agy "$@" ;;
+    *) af_die "step '$step': unknown agent CLI '$cli'" "$AF_EX_USAGE" ;;
+  esac
+}
+
+# Every vendor records what it spent, in a file rather than a variable: this
+# runs in background subshells for the parallel audits and under the spinner,
+# and a subshell's variable assignments do not reach the parent. Only
+# `claude` reports dollars; the other two report tokens against a separate
+# quota, and a zero here is "not billed to the figure af_worst_case bounds",
+# not "free" - see the confirmation screen.
+af_record_spend() { printf '%s\n' "$1" >> "$AF_RUN_DIR/spend.txt"; }
+
+# `claude` and `agy` both return a JSON envelope on stdout with the result in
+# .structured_output. Only their success/failure fields differ, so each
+# checks those itself and then calls this.
+af_structured_from_envelope() {
+  local step="$1" log="$2" out="$3"
+  jq -e '.structured_output != null' "$log" >/dev/null 2>&1 \
+    || af_die "step '$step': no structured_output (see $log)" "$AF_EX_SCHEMA"
+  jq '.structured_output' "$log" > "$out"
+}
+
+af_vendor_claude() {
   local step="$1" model="$2" budget="$3" mode="$4" schema="$5"
   local out="$6" log="$7" prompt="$8"
-  : "${AF_RUN_DIR:?internal error: agent invoked before af_setup_run}"
   local -a args=(
     --print --output-format json --no-session-persistence
     --model "$model" --json-schema "$schema"
@@ -446,19 +496,138 @@ Nothing agentfixer or this repository produced was rejected; the upstream call c
   if ! jq -e '.is_error == false and .subtype == "success"' "$log" >/dev/null 2>&1; then
     af_die "step '$step': agent reported failure (see $log)" "$AF_EX_SCHEMA"
   fi
-  if ! jq -e '.structured_output != null' "$log" >/dev/null 2>&1; then
-    af_die "step '$step': no structured_output (see $log)" "$AF_EX_SCHEMA"
-  fi
-  jq '.structured_output' "$log" > "$out"
-
-  # Recorded in a file, not a variable: this function runs in background
-  # subshells for the parallel audits and under the spinner, and a subshell's
-  # variable assignments do not reach the parent.
-  jq -r '.total_cost_usd // 0' "$log" >> "$AF_RUN_DIR/spend.txt"
+  af_structured_from_envelope "$step" "$log" "$out"
+  af_record_spend "$(jq -r '.total_cost_usd // 0' "$log")"
 
   if jq -e '(.permission_denials | length) > 0' "$log" >/dev/null 2>&1; then
     af_log warn "step '$step' had tool denials; see $log"
   fi
+}
+
+# Translates one of the AF_SCHEMA_* strings into the strict dialect OpenAI's
+# structured-output API enforces. Done at call time from the same string
+# every other vendor is handed, so there is no second copy to drift.
+#
+# Two rules, both measured against a real HTTP 400 from codex-cli 0.149.1:
+#   - every object needs "additionalProperties": false
+#   - every object's "required" must name EVERY key in its properties
+#     ("'required' is required to be supplied and to be an array including
+#     every key in properties. Missing 'objection'.")
+# The second rule alone would turn an optional field into a mandatory one, so
+# a property the original schema left out of `required` gets null added to
+# its type instead: it must be present, and null is how the model says "not
+# applicable". jq's `// ` idiom that reads these fields treats null and
+# absent identically, so nothing downstream has to know.
+af_strict_schema() {
+  printf '%s' "$1" | jq '
+    def strict:
+      if type == "object" then
+        ( if .type == "object" and (.properties | type) == "object" then
+            (.required // []) as $req
+            | .properties |= with_entries(
+                if (.key | IN($req[])) then .
+                else .value |= (if (.type | type) == "string"
+                                then .type = [.type, "null"] else . end)
+                end)
+            | .required = (.properties | keys)
+            | .additionalProperties = false
+          else . end)
+        | with_entries(.value |= strict)
+      elif type == "array" then map(strict)
+      else . end;
+    strict'
+}
+
+# codex-cli. Four traps, all measured against codex-cli 0.149.1, and none of
+# them shared with `claude`:
+#   - `codex exec` with no prompt blocks on stdin waiting for a terminal.
+#     The positional `-` says "read the prompt from stdin", which is the
+#     claude-shaped call and cannot hang, since the here-string always closes.
+#   - a prompt passed as the bare positional would be parsed as a SUBCOMMAND
+#     whenever its first word is `review`, `resume`, `fork` or `help`. `-`
+#     removes that ambiguity too.
+#   - --output-schema takes a FILE, in the strict dialect (af_strict_schema);
+#     an ordinary JSON Schema is rejected with HTTP 400 invalid_json_schema.
+#   - the result goes to --output-last-message, NOT to .structured_output.
+#
+# Failure is loud and terminal. There is no fallback to a Claude reviewer: a
+# quality gate whose whole value is that a different vendor read the diff has
+# no value at all if it quietly degrades to the vendor that wrote it. Missing
+# binary, expired login and a 400 all land here, so the message names the
+# remedy rather than leaving the operator to guess which one it was.
+af_vendor_codex() {
+  local step="$1" model="$2" mode="$4" schema="$5" out="$6" log="$7" prompt="$8"
+  local rc=0 schemafile="$log.schema.json" msgfile="$log.last" err
+  [ "$mode" = "ro" ] || af_die \
+    "step '$step': the codex CLI is wired read-only here; mode '$mode' is not supported" \
+    "$AF_EX_USAGE"
+  af_strict_schema "$schema" > "$schemafile" \
+    || af_die "step '$step': could not translate the schema for codex" "$AF_EX_SCHEMA"
+  rm -f "$msgfile"
+  # --ephemeral for the same reason `claude` gets --no-session-persistence:
+  # the prompt carries the repository's diff, and this tool does not leave
+  # copies of it in a second CLI's session store.
+  AF_STEP="$step" codex exec --model "$model" --sandbox read-only --ephemeral \
+    --output-schema "$schemafile" --output-last-message "$msgfile" - \
+    > "$log" 2>>"$log.stderr" <<<"$prompt" || rc=$?
+  if [ "$rc" -ne 0 ] || [ ! -s "$msgfile" ]; then
+    # codex echoes the entire prompt back on stderr, and this step's prompt is
+    # the repository's own diff. The last N bytes of that stream are the tail
+    # of the diff, not the failure, so the cause is grepped out rather than
+    # tailed - and the classification below reads only those lines. Reading it
+    # from raw stderr would let a diff that merely contains the string "429"
+    # be reported as a rate limit.
+    err="$(grep -aiE 'error|denied|unauthori|not logged|login|429|rate limit|usage limit|quota' \
+             "$log.stderr" 2>/dev/null | tail -5 || true)"
+    [ -n "$err" ] || err="$(tail -c 400 "$log.stderr" 2>/dev/null || true)"
+    # A codex rate limit is the same class of event as a Claude one and is
+    # classified the same way, so the halt path can still rescue the work.
+    case "$err" in
+      *429*|*"rate limit"*|*"usage limit"*|*"quota"*)
+        af_die "step '$step': codex could not complete the call - $err
+Nothing agentfixer or this repository produced was rejected; the upstream call could not complete, so the run stopped where it stood. Any committed work is still in $AF_WORKTREE. Re-run when the limit clears." "$AF_EX_UPSTREAM" ;;
+    esac
+    af_die "step '$step': the codex CLI failed (exit $rc). agentfixer will NOT
+review a Claude-authored fix with a Claude reviewer, so this stops the run
+rather than falling back.
+  - not installed?  npm i -g @openai/codex   (needs 'codex exec')
+  - not logged in?  codex login
+  - something else? $err
+Set AF_REVIEW_CLI to another CLI only if you accept losing the vendor split." \
+      "$AF_EX_SCHEMA"
+  fi
+  jq -e . "$msgfile" > "$out" 2>/dev/null \
+    || af_die "step '$step': codex returned no valid JSON (see $msgfile)" "$AF_EX_SCHEMA"
+  # codex reports tokens, not dollars, and against a separate quota.
+  af_record_spend 0
+}
+
+# agy. Its own single trap: --print takes an OPTIONAL value, so
+# `--print --output-format json` silently makes "--output-format" the prompt
+# and leaves "json" as a stray argument. The prompt must be attached with
+# `=`. Extraction is claude-shaped (.structured_output); the success field is
+# not (.status == "SUCCESS").
+#
+# Note for prompt authors: agy's --json-schema is not schema-constrained
+# decoding. Measured against agy 1.1.22, a schema of one string property gets
+# the model's whole reply wrapped into that property verbatim - preamble,
+# code fence and all - and still validates. The prompt has to do the work.
+af_vendor_agy() {
+  local step="$1" model="$2" mode="$4" schema="$5" out="$6" log="$7" prompt="$8"
+  local rc=0
+  [ "$mode" = "ro" ] || af_die \
+    "step '$step': the agy CLI is wired read-only here; mode '$mode' is not supported" \
+    "$AF_EX_USAGE"
+  AF_STEP="$step" agy --print="$prompt" --output-format json \
+    --json-schema "$schema" --model "$model" --disable-slash-commands \
+    --print-timeout "${AF_AGY_TIMEOUT:-120s}" \
+    > "$log" 2>>"$log.stderr" </dev/null || rc=$?
+  [ "$rc" -eq 0 ] \
+    || af_die "step '$step': agy exited $rc (see $log.stderr)" "$AF_EX_SCHEMA"
+  jq -e '.status == "SUCCESS"' "$log" >/dev/null 2>&1 \
+    || af_die "step '$step': agy reported failure (see $log)" "$AF_EX_SCHEMA"
+  af_structured_from_envelope "$step" "$log" "$out"
+  af_record_spend 0
 }
 
 # ---------------------------------------------------------------- schemas
@@ -894,14 +1063,31 @@ af_commit_fixes() {
 # Nothing between `fix` and `pr` used to ask the one question that matters:
 # does this diff actually fix the finding it claims to, and does it break
 # anything else? G1 catches .github/ tampering and G2 catches dropped ids;
-# neither reads the code. This does, in a fresh `claude -p` process per round
-# - a reviewer that inherited the fixer's reasoning about its own work would
-# be reviewing the argument rather than the change.
+# neither reads the code. This does, in a fresh agent process per round - a
+# reviewer that inherited the fixer's reasoning about its own work would be
+# reviewing the argument rather than the change.
+#
+# And in a DIFFERENT VENDOR's process. Claude writing the fix and Claude
+# reviewing it shares a training distribution, and so shares the blind spots:
+# the same instinct that produced the fix is the one asked to fault it. This
+# is the reason the tool already runs security-audit and hostile-review as
+# two auditors rather than one, taken one stage further. codex is the default
+# reviewer, not a fallback - when it cannot run, the step fails (see
+# af_vendor_codex) rather than quietly handing the job back to the vendor
+# that wrote the diff.
+#
+# It also moves the review off the constrained resource: reviews are charged
+# to the codex quota, so a Claude session limit no longer costs the run its
+# reviewer as well as its fixer.
 #
 # Read-only, and so unsandboxed for exactly the reason `verify` is: it only
-# reads. Same model and cap as `verify` too - it is the same job (adversarial
-# judgement over a bounded set of findings), one stage later.
-AF_MODEL_REVIEW="${AF_MODEL_REVIEW:-opus}"
+# reads. AF_BUDGET_REVIEW is a `claude` knob (--max-budget-usd) and is only
+# enforced when AF_REVIEW_CLI is claude; codex-cli has no spend cap to pass.
+AF_REVIEW_CLI="${AF_REVIEW_CLI:-codex}"
+case "$AF_REVIEW_CLI" in
+  codex) AF_MODEL_REVIEW="${AF_MODEL_REVIEW:-gpt-5.5}" ;;
+  *)     AF_MODEL_REVIEW="${AF_MODEL_REVIEW:-opus}" ;;
+esac
 AF_BUDGET_REVIEW="${AF_BUDGET_REVIEW:-3}"
 # The maximum number of REVIEW calls per iteration. Every review that objects
 # and is not the last permitted one costs one further fix call, so the real
@@ -1060,7 +1246,8 @@ af_step_review() {
   prompt="$(af_prompt_review "$iter" "$diff" "$scope")"
   ( cd "$AF_WORKTREE" && af_run_agent review "$AF_MODEL_REVIEW" \
       "$AF_BUDGET_REVIEW" ro "$AF_SCHEMA_REVIEW" \
-      "$iter/review-$round.json" "$iter/review-$round.log" "$prompt" ) \
+      "$iter/review-$round.json" "$iter/review-$round.log" "$prompt" \
+      "$AF_REVIEW_CLI" ) \
     || af_die "review round $round failed" "$?"
 
   # G2, first half: every id this round was ASKED about must come back with
@@ -1200,13 +1387,14 @@ af_review_section() {
     printf "_Skipped: \`AF_REVIEW_ROUNDS=0\`._\n"
   elif [ -f "$iter/review-unresolved" ]; then
     printf '%s\n\n%s\n' \
-      "**Not approved.** An independent reviewer still objected after $rounds round(s). agentfixer did **not** merge this — it needs a human." \
+      "**Not approved.** \`$AF_REVIEW_CLI\` still objected after $rounds round(s). agentfixer did **not** merge this — it needs a human." \
       "$hist"
   elif [ -z "$hist" ]; then
-    printf '_Approved by an independent reviewer on the first round._\n'
+    printf '%s\n' \
+      "_Approved on the first round by \`$AF_REVIEW_CLI\`, a different vendor from the one that wrote the fix._"
   else
     printf '%s\n\n%s\n' \
-      "Approved by an independent reviewer in round $rounds. Earlier rounds objected:" \
+      "Approved in round $rounds by \`$AF_REVIEW_CLI\`, a different vendor from the one that wrote the fix. Earlier rounds objected:" \
       "$hist"
   fi
 }
@@ -1268,13 +1456,13 @@ $rejected
 $review
 
 ### Provenance
-| step | model |
-|---|---|
-| audit | $AF_MODEL_AUDIT |
-| combine | $AF_MODEL_COMBINE |
-| verify | $AF_MODEL_VERIFY |
-| fix | $AF_MODEL_FIX |
-| review | $AF_MODEL_REVIEW |
+| step | cli | model |
+|---|---|---|
+| audit | claude | $AF_MODEL_AUDIT |
+| combine | claude | $AF_MODEL_COMBINE |
+| verify | claude | $AF_MODEL_VERIFY |
+| fix | claude | $AF_MODEL_FIX |
+| review | $AF_REVIEW_CLI | $AF_MODEL_REVIEW |
 
 Run log: \`$AF_RUN_DIR\`
 
@@ -1343,11 +1531,93 @@ af_halt_not_done() {
   printf -- '- **Never reached CI.** No required check has run against this branch, and nothing was merged.\n'
 }
 
+# ------------------------------------------- the halt narrative, composed
+# A run killed by a Claude rate limit is the one halt that says nothing about
+# the code: the work is as good as it was a second earlier, and the operator
+# most needs a plain-English account of where it got to. The bash template
+# below can only list gates ("review did not run"), so a THIRD vendor writes
+# the prose - the second cannot, it is the one that just ran out of quota.
+#
+# The division is strict, and is the reason this is allowed at all: every
+# fact in the prompt is read here, from this run's JSON artifacts and from
+# git. The model composes sentences out of facts it is given and is told, in
+# as many words, that it may not add any. Nothing it returns is trusted as
+# evidence - the template's own factual sections are still emitted below it.
+AF_PRBODY_CLI="${AF_PRBODY_CLI:-agy}"
+# Deliberately not a Claude model: this composes the body precisely when the
+# Claude quota is the thing that ran out.
+AF_MODEL_PRBODY="${AF_MODEL_PRBODY:-gemini-3.7-flash-medium}"
+# shellcheck disable=SC2034
+read -r -d '' AF_SCHEMA_PRBODY <<'SCHEMA' || true
+{"type":"object","required":["body"],"properties":{"body":{"type":"string"}}}
+SCHEMA
+
+# True for the halt causes this is for. The cause text is af_die's own
+# message, e.g. "the Claude API returned 429 - You've hit your session limit".
+af_rate_limited() {
+  case "$1" in
+    *429*|*"session limit"*|*"rate limit"*|*"usage limit"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+af_prompt_halt_body() {
+  local iter="$1" why="$2" fixed="none - the run died before any fix landed"
+  if [ -f "$iter/confirmed.json" ] && [ -f "$iter/fixed.json" ]; then
+    fixed="$(jq -r -s '
+      .[0] as $c | .[1].results as $r
+      | [ $r[] | select(.status == "fixed") | .id as $id
+          | ($c[] | select(.id == $id))
+          | "\(.id) (\(.severity), \(.file):\(.line)): \(.title)" ]
+      | if length == 0 then "none - every confirmed finding was skipped"
+        else join("\n") end
+    ' "$iter/confirmed.json" "$iter/fixed.json")" || fixed="unreadable"
+  fi
+  cat <<PROMPT
+You are writing the opening of a GitHub pull request body for an automated
+run that stopped part-way. Output ONLY that text: no preamble, no "here is",
+no sign-off, no surrounding code fence. Start with the level-3 heading
+"### What happened". Under 180 words, GitHub-flavoured markdown.
+
+Use ONLY the facts below. Do not add a cause, a recommendation, a severity,
+a file name, a count or a next step that is not written here. If something is
+not stated, it is not known - say so or leave it out. A reader will act on
+this, and anything you invent is a lie they will act on.
+
+Findings that were fixed and are committed on this branch:
+$fixed
+
+Why the run stopped:
+$why
+
+What the run never did:
+$(af_halt_not_done "$iter")
+
+Say, in your own words: what landed, that it is unreviewed and unmerged, that
+the halt was an upstream limit rather than anything wrong with the code or
+the repository, and that re-running when the limit clears is the normal
+response.
+PROMPT
+}
+
+# Prints the composed section, or fails. Never dies: this runs from the EXIT
+# trap, where the halt already in flight is the news and a composer that
+# could not run must not become the story - or the exit code.
+af_halt_narrative() {
+  local iter="$1" why="$2" prompt out
+  out="$iter/halt-narrative.json"
+  prompt="$(af_prompt_halt_body "$iter" "$why")" || return 1
+  ( af_run_agent prbody "$AF_MODEL_PRBODY" 0 ro "$AF_SCHEMA_PRBODY" \
+      "$out" "$iter/prbody.log" "$prompt" "$AF_PRBODY_CLI" ) >/dev/null 2>&1 \
+    || return 1
+  jq -e -r '.body | select(type == "string" and length > 0)' "$out" 2>/dev/null
+}
+
 # The header every halt-path PR body opens with. The body is the only place a
 # human learns what happened, so it says it in the first screenful rather than
 # leaving it to be inferred from a section further down.
 af_halt_banner() {
-  local rc="$1" why="$2" iter="$3" commits notdone
+  local rc="$1" why="$2" iter="$3" narrative="${4:-}" commits notdone
   # Computed before the heredoc, not inside it: a command substitution nested
   # in an unquoted heredoc that itself needs backticks is unreadable, and
   # unreadable quoting is how a body silently comes out half-empty.
@@ -1361,7 +1631,9 @@ af_halt_banner() {
 The run stopped before this work could clear the gates a normal agentfixer PR
 clears. It is published so the commits are not stranded in a cache directory
 nobody looks in, and published as a **draft** so nobody merges them by reflex.
-
+${narrative:+
+$narrative
+}
 ### Why the run halted (exit $rc)
 
 \`\`\`
@@ -1420,7 +1692,7 @@ af_pr_needs_human() {
 # died and is what the operator has to be told, so every failure in this
 # function is reported and swallowed.
 af_rescue_pr() {
-  local rc="$1" why url bodyfile
+  local rc="$1" why url bodyfile narrative
   case "$rc" in "$AF_EX_BUDGET"|"$AF_EX_UPSTREAM") ;; *) return 0 ;; esac
   [ -n "${AF_WORKTREE:-}" ] && [ -d "$AF_WORKTREE" ] || return 0
   [ -n "${AF_SLUG:-}" ] && [ -n "${AF_ITER_DIR:-}" ] || return 0
@@ -1439,7 +1711,26 @@ af_rescue_pr() {
   why="$(cat "$AF_RUN_DIR/halt.txt" 2>/dev/null)" \
     || why="agentfixer exited $rc; the reason was not recorded."
   bodyfile="$AF_ITER_DIR/halt-pr-body.md"
-  af_halt_banner "$rc" "$why" "$AF_ITER_DIR" > "$bodyfile" || return 0
+  # A rate limit is the one halt worth explaining in prose - see
+  # af_halt_narrative. Every other halt keeps the bash template alone. When
+  # the composer is missing or fails, the template is what remains and the
+  # body says which one the reader is looking at, because "an agent wrote
+  # this summary" and "a shell script did" are not the same claim.
+  narrative=""
+  if [ "$rc" = "$AF_EX_UPSTREAM" ] && af_rate_limited "$why"; then
+    if narrative="$(af_halt_narrative "$AF_ITER_DIR" "$why")" \
+       && [ -n "$narrative" ]; then
+      narrative="$narrative
+
+_Prose composed by \`$AF_PRBODY_CLI\` from this run's own JSON artifacts; every
+section below it is agentfixer's, unedited._"
+    else
+      narrative="_\`$AF_PRBODY_CLI\` was asked to summarise this halt and could
+not (not installed, not authenticated, or it failed). What follows is
+agentfixer's own template._"
+    fi
+  fi
+  af_halt_banner "$rc" "$why" "$AF_ITER_DIR" "$narrative" > "$bodyfile" || return 0
   # Only if the iteration got far enough to have one. A halt during `fix`
   # itself leaves no fixed.json, and af_pr_body would die reading it.
   if [ -f "$AF_ITER_DIR/fixed.json" ] && [ -f "$AF_ITER_DIR/confirmed.json" ]; then
@@ -1705,6 +1996,20 @@ Refusing to merge." "$AF_EX_GATE" ;;
 
   paths="$(af_range_paths "$AF_BASE_SHA..HEAD")" \
     || af_die "G1: could not read the merge range $AF_BASE_SHA..HEAD" "$AF_EX_GATE"
+  # G1 here is not G1 anywhere else in this tool. Everywhere earlier it fires
+  # on a worktree, and the response is to quarantine the work locally rather
+  # than publish an agent's .github/ tampering to the remote. By the time the
+  # merge gate runs, that content is already pushed and already carries an
+  # open, NON-DRAFT, unlabelled, mergeable pull request - so "do not publish
+  # it" has nothing left to protect, and dying on the spot leaves a mergeable
+  # PR full of workflow tampering one click from landing. Converting it to a
+  # draft and labelling it publishes nothing new and removes exactly that.
+  # Probed in a subshell so the gate keeps its single definition of what
+  # counts as tampering; the second call is the one that reports and exits.
+  if ! ( af_gate_workflows "$paths" ) 2>/dev/null; then
+    af_pr_needs_human "$pr"
+    af_log warn "G1 at merge: PR #$pr converted to a draft and labelled needs-human"
+  fi
   af_gate_workflows "$paths"
 
   head="$(af_git rev-parse HEAD)"
@@ -1899,10 +2204,18 @@ af_pick_repos() {
 # but the last one costs, and every permitted cifix retry. The review terms
 # are (w reviews + w-1 re-fixes) and vanish at AF_REVIEW_ROUNDS=0; awk's
 # max(w-1,0) keeps the re-fix term from going negative there.
+#
+# The w*q review term is charged only when the reviewer is `claude`. This
+# figure is a sum of caps that are actually enforced (--max-budget-usd), and
+# codex-cli has no such flag to pass: charging AF_BUDGET_REVIEW against a
+# vendor that never sees it would make the number a guess wearing the word
+# "worst case". The re-fixes stay - they are always `claude`.
 af_worst_case() {
+  local q=0
+  [ "$AF_REVIEW_CLI" != "claude" ] || q="$AF_BUDGET_REVIEW"
   awk -v a="$AF_BUDGET_AUDIT" -v c="$AF_BUDGET_COMBINE" -v v="$AF_BUDGET_VERIFY" \
       -v f="$AF_BUDGET_FIX" -v x="$AF_BUDGET_CIFIX" -v r="$AF_CI_RETRIES" \
-      -v w="$AF_REVIEW_ROUNDS" -v q="$AF_BUDGET_REVIEW" \
+      -v w="$AF_REVIEW_ROUNDS" -v q="$q" \
       -v n="$1" -v i="$2" \
       'BEGIN { rf = (w > 1 ? w - 1 : 0)
                printf "%.2f", n * i * (2*a + c + v + f + w*q + rf*f + r*x) }'
@@ -1925,6 +2238,11 @@ af_confirm() {
     if [ -n "$sub" ]; then
       printf "  note:       authenticated via a Claude '%s' subscription - the figure above is a notional API-rate equivalent, not billed spend. Pass --no-budget to remove per-step caps.\n" "$sub"
     fi
+  fi
+  if [ "$AF_REVIEW_CLI" != "claude" ] && [ "$AF_REVIEW_ROUNDS" != "0" ]; then
+    printf '  review:     %s (%s), up to %s round(s) per iteration. Charged to that\n' \
+      "$AF_REVIEW_CLI" "$AF_MODEL_REVIEW" "$AF_REVIEW_ROUNDS"
+    printf '              vendor'"'"'s quota, uncapped - not included above.\n'
   fi
   printf '\n  Agents will open and merge PRs in these repos. Continue? [y/N] '
   read -r reply
