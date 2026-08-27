@@ -334,6 +334,16 @@ echo stray > stray-r1.txt
   [ "$output" = "23.00" ]
 }
 
+# The README states both of these figures outright, and its accuracy is a
+# safety property here: the confirmation screen calls the number a cap, not
+# an estimate.
+@test "the README's worst-case figures are the ones af_worst_case computes" {
+  run bash -c "$SRC af_worst_case 1 1"
+  [ "$output" = "46.00" ]
+  run bash -c "$SRC AF_REVIEW_ROUNDS=0; af_worst_case 1 1"
+  [ "$output" = "25.00" ]
+}
+
 @test "worst-case spend drops back when the review stage is disabled" {
   run bash -c "$SRC AF_BUDGET_AUDIT=2 AF_BUDGET_COMBINE=1 AF_BUDGET_VERIFY=2 AF_BUDGET_FIX=4 AF_BUDGET_CIFIX=1 AF_CI_RETRIES=2 AF_REVIEW_ROUNDS=0
     af_worst_case 1 1"

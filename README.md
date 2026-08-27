@@ -1,8 +1,14 @@
 # agentfixer
 
 Point it at a git repo. It audits the code with two independent Claude agents,
-re-verifies every finding in a fresh context, fixes the confirmed ones, opens a
-PR, drives it to green CI, and merges. Repeat N times.
+re-verifies every finding in a fresh context, fixes the confirmed ones, has a
+fourth agent review the fix, opens a PR, drives it to green CI, and merges.
+Repeat N times.
+
+```
+audit ×2 → combine → verify → fix → review ⇄ fix → pr → ci ⇄ cifix → merge
+                                       (≤ AF_REVIEW_ROUNDS)  (≤ AF_CI_RETRIES)
+```
 
 Every pipeline step is a separate `claude -p` process, so each one starts with
 a clean context and can't be talked out of what it's supposed to check. Merge
@@ -80,6 +86,47 @@ appear in the interactive picker (`--yes` suppresses them there). A headless
 `--repo` run — the form you'd use from cron — starts immediately with no
 prompt, so know your `--iterations` and budget before you script it.
 
+## The fix review
+
+Between the fix commit and the PR, a fresh read-only agent is handed two
+things — the commit diff for this iteration's fixes, and the confirmed
+findings those fixes were supposed to address — and asked, per finding:
+does this diff actually fix *that* finding, and does it break anything else?
+
+It is a new `claude -p` process every round, like every other step. That
+isolation is the whole point: a reviewer that inherited the fixer's reasoning
+about its own work would be reviewing the argument, not the change. It gets
+the same `--json-schema` treatment as every other step and the same
+completeness gate (G2) — it must return exactly one verdict per finding id,
+so it cannot approve a finding by quietly dropping it.
+
+If it objects, the objections go verbatim to a **fresh** fix agent, which
+amends the work in place. G1 (no `.github/`) and G2 (no dropped ids) run on
+the amended work exactly as they do on the first pass, and the round is
+committed on top. Then it is reviewed again. Up to `AF_REVIEW_ROUNDS` review
+calls (default 3).
+
+**If the cap is reached with objections still outstanding**, agentfixer:
+
+- pushes the branch and opens the PR anyway — a human has to be able to see
+  what the reviewer refused,
+- writes the unresolved objections into the PR body under
+  `### Fix review` → **Not approved**,
+- labels it `needs-human`,
+- and **halts the run with exit 3 without merging**. It does not proceed to
+  CI or merge, and it does not start another iteration on top of code a
+  reviewer never cleared.
+
+Objections are recorded in the PR body **even when a later round resolved
+them**, for the same reason this tool already lists the findings *rejected*
+during verification: which findings were hard is something the human reading
+the PR wants to know.
+
+`AF_REVIEW_ROUNDS=0` disables the stage outright — no reviewer runs, `fix`
+goes straight to `pr`, and the PR body says so. It does not mean "review once
+and never loop back"; that reading would make `0` a synonym for `1`. The
+value is validated before preflight, so a typo is a zero-spend exit 1.
+
 ## Branch protection is required
 
 Two separate checks enforce this, both hard failures:
@@ -98,12 +145,13 @@ status check.
 
 ## Sandbox: what it protects, and what it does not
 
-Write-mode steps (`fix`, and `cifix` when repairing a failing CI run) run
-under `bwrap` with `--permission-mode bypassPermissions` — they read
-untrusted repository content and can act on it with no human in the loop, so
+Write-mode steps (`fix`, the re-fix rounds the review loop drives, and
+`cifix` when repairing a failing CI run) run under `bwrap` with
+`--permission-mode bypassPermissions` — they read untrusted repository
+content and can act on it with no human in the loop, so
 a prompt injection there has unrestricted Bash. Read-only steps (both
-auditors, combine, verify) are never sandboxed: they can't write anything,
-and they need the real `~/.claude/skills` on disk to resolve `/security-audit`
+auditors, combine, verify, review) are never sandboxed: they can't write
+anything, and they need the real `~/.claude/skills` on disk to resolve `/security-audit`
 and `/hostile-review`.
 
 **What the sandbox protects**, precisely:
@@ -169,6 +217,10 @@ recommended.
   with `.github` — working-tree changes before a commit, and the full commit
   range before a merge, are both checked, including renames into or out of
   `.github/`.
+- Merge a fix its reviewer never approved. If the review loop hits
+  `AF_REVIEW_ROUNDS` with objections outstanding, the PR is opened and
+  labelled `needs-human`, and the run halts at exit 3 — no CI, no merge, no
+  next iteration.
 - Force push. Ever.
 - Touch your working tree. All work happens in a throwaway git worktree
   under `~/.cache/agentfixer/<repo>/<timestamp>/worktree` (override the cache
@@ -185,7 +237,7 @@ recommended.
 | 0 | completed |
 | 1 | usage error, or a preflight check failed before the run started — nothing was spent |
 | 2 | CI could not be made green (timed out, or exhausted its retries); the PR is left open, labelled `needs-human` |
-| 3 | a safety gate tripped mid-run: `.github/` was touched (G1), the changed-path list behind G1 could not be read at all, the PR has zero required checks (G3), their state could not be read at all (G3 — a `gh` error is not evidence of anything, so it refuses), the merge-time recheck of required checks finds them not passing (G3), the merge itself was refused by GitHub, or `bwrap` is unavailable for a write-mode step and `--no-sandbox` wasn't passed |
+| 3 | a safety gate tripped mid-run: `.github/` was touched (G1), the changed-path list behind G1 could not be read at all, the fix reviewer never approved within `AF_REVIEW_ROUNDS` (G4 — PR opened and labelled `needs-human`, nothing merged), the PR has zero required checks (G3), their state could not be read at all (G3 — a `gh` error is not evidence of anything, so it refuses), the merge-time recheck of required checks finds them not passing (G3), the merge itself was refused by GitHub, or `bwrap` is unavailable for a write-mode step and `--no-sandbox` wasn't passed |
 | 4 | an agent returned invalid, incomplete, or non-schema-conforming output — includes the verify/fix id-set mismatch (G2) and `combine` inventing non-canonical ids |
 | 5 | a step hit its `--max-budget-usd` cap. Nothing is malformed — the output just wasn't finished. The message names the step, the cap, the spend, and the `AF_BUDGET_*` variable to raise (see Cost below) |
 
@@ -197,6 +249,12 @@ because it's only ever checked at the first write-mode step (`fix`), by which
 point audit, combine, and verify have already spent budget — calling that
 "nothing was spent" would be false.
 
+An unapproved fix review is code 3 rather than a code of its own: the
+reviewer's output was perfectly well-formed (so not 4), CI never ran (so not
+2), and the operator response is identical to the existing code-3 CI-gate
+paths — go look at the `needs-human` PR. A gate that did not open is a gate
+that did not open, and the exit codes are a contract worth not inflating.
+
 Code 5 is deliberately distinct from code 4: a cron log reading "exit 4"
 should send someone looking for a schema bug, and a budget cap running out
 is not one — it's an operational limit that needs a bigger number, not a
@@ -205,8 +263,15 @@ fix to agentfixer's output validation.
 ## Cost
 
 Each step has a `--max-budget-usd` cap. At the defaults (2 audits × $3,
-combine $1, verify $3, fix $6, plus up to 3 cifix retries × $3), worst case
-is **$25 per repo, per iteration**. The interactive confirmation screen
+combine $1, verify $3, fix $6, up to 3 review rounds × $3 and the 2 re-fixes
+those rounds can cost × $6, plus up to 3 cifix retries × $3), worst case is
+**$46 per repo, per iteration**.
+
+**The review stage costs at least one extra agent call per iteration**, and
+at most `AF_REVIEW_ROUNDS` reviews plus `AF_REVIEW_ROUNDS - 1` re-fixes — 3
+reviews and 2 re-fixes at the defaults, so 5 extra calls worst case, 1 in the
+common case where the first review approves. Set `AF_REVIEW_ROUNDS=0` to turn
+the stage off and get the old $25 ceiling back. The interactive confirmation screen
 multiplies that by the number of repos selected and the iteration count and
 shows the total before anything starts — but only in the interactive picker;
 see the `--repo` note above.
@@ -250,11 +315,13 @@ Override the defaults with environment variables:
 | `AF_BUDGET_AUDIT` | 3 | each of the two parallel auditors |
 | `AF_BUDGET_COMBINE` | 1 | merging the two findings lists |
 | `AF_BUDGET_VERIFY` | 3 | re-verification |
-| `AF_BUDGET_FIX` | 6 | applying fixes |
+| `AF_BUDGET_FIX` | 6 | applying fixes, and each re-fix round the reviewer forces |
+| `AF_BUDGET_REVIEW` | 3 | each review round |
 | `AF_BUDGET_CIFIX` | 3 | each CI-repair attempt |
 | `AF_BUDGET=off` | unset | disables every per-step cap outright, same as `--no-budget` |
 | `AF_CI_RETRIES` | 3 | max cifix attempts before giving up (exit 2) |
-| `AF_MODEL_AUDIT`, `AF_MODEL_COMBINE`, `AF_MODEL_VERIFY`, `AF_MODEL_FIX`, `AF_MODEL_CIFIX` | opus/sonnet/opus/opus/sonnet | model per step |
+| `AF_REVIEW_ROUNDS` | 3 | max review rounds before giving up (exit 3); `0` disables the stage |
+| `AF_MODEL_AUDIT`, `AF_MODEL_COMBINE`, `AF_MODEL_VERIFY`, `AF_MODEL_REVIEW`, `AF_MODEL_FIX`, `AF_MODEL_CIFIX` | opus/sonnet/opus/opus/opus/sonnet | model per step |
 | `AF_CACHE` | `~/.cache/agentfixer` | where worktrees and run logs live |
 | `AF_CI_TIMEOUT` | 1800 (seconds) | how long to wait for CI to settle |
 | `AF_CHECKS_GRACE` | 100 (seconds) | how long an empty required-check set is treated as not-yet-registered before G3 concludes the repo has none |
