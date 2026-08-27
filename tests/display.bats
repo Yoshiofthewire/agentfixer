@@ -80,6 +80,55 @@ setup() {
   while read -r line; do [ "${#line}" -le 60 ]; done <<< "$output"
 }
 
+# Regression: af_render_tty rewinds with \033[%dA using AF_LINES, counted as
+# LOGICAL lines. A line longer than the terminal wraps into extra PHYSICAL
+# rows the rewind never accounts for, so stale rows (e.g. old headers) are
+# left on screen. If every rendered line is truncated to the terminal width,
+# logical lines and physical rows are the same number by construction. This
+# must fail against a pre-fix af_render_tty, whose header/separator/note
+# lines are not width-bounded.
+@test "render_tty: physical row count matches AF_LINES at a narrow width" {
+  run bash -c "
+    source '$AF_SCRIPT'
+    COLUMNS=24
+    AF_REPO_LABEL='a-very-long-repository-name-that-is-long'
+    AF_ITER_LABEL='iteration 1/1 with a long label'
+    AF_STATE[audit]=active
+    AF_NOTE[audit]='this is a long status note that will definitely overflow twenty four columns'
+    af_render_tty > '$AF_TMP/rendered.txt'
+    printf 'LINES=%s\n' \"\$AF_LINES\"
+  "
+  [ "$status" -eq 0 ]
+  local w=24 lines_reported physical=0 n rows
+  lines_reported="$(printf '%s' "$output" | grep -o 'LINES=[0-9]*' | cut -d= -f2)"
+  while IFS= read -r line || [ -n "$line" ]; do
+    n="$(printf '%s' "$line" | wc -m)"
+    rows=$(( (n + w - 1) / w ))
+    [ "$rows" -eq 0 ] && rows=1
+    physical=$((physical + rows))
+  done < "$AF_TMP/rendered.txt"
+  [ "$physical" -eq "$lines_reported" ]
+}
+
+# Same narrow width, but proves it directly: no rendered line is long enough
+# to wrap at all.
+@test "render_tty: no rendered line exceeds the terminal width" {
+  run bash -c "
+    source '$AF_SCRIPT'
+    COLUMNS=24
+    AF_REPO_LABEL='a-very-long-repository-name-that-is-long'
+    AF_ITER_LABEL='iteration 1/1 with a long label'
+    AF_STATE[audit]=active
+    AF_NOTE[audit]='this is a long status note that will definitely overflow twenty four columns'
+    af_render_tty
+  "
+  [ "$status" -eq 0 ]
+  while IFS= read -r line || [ -n "$line" ]; do
+    n="$(printf '%s' "$line" | wc -m)"
+    [ "$n" -le 24 ]
+  done <<< "$output"
+}
+
 @test "spinner waits for the command and propagates its exit code" {
   run bash -c "$SRC AF_SPIN_POLL=0; af_with_spinner fix bash -c 'exit 4'"
   [ "$status" -eq 4 ]

@@ -97,6 +97,53 @@ beta' 3 </dev/null"
   [[ "$output" == *'$78.00'* ]]
 }
 
+# --no-budget must not print a dollar worst-case as though it were an
+# authorization - there's no cap to authorize against. It still warns that
+# a large run consumes a lot, just not denominated in money.
+@test "confirmation says uncapped, not a dollar figure, when budgets are off" {
+  run bash -c "$SRC AF_NO_BUDGET=1
+    af_confirm 'alpha' 1 </dev/null"
+  [[ "$output" == *"uncapped"* ]]
+  [[ "$output" != *'$'* ]]
+}
+
+@test "--no-budget is accepted by af_main and sets AF_NO_BUDGET" {
+  run bash -c "$SRC af_main --no-budget --version; echo AF_NO_BUDGET=\$AF_NO_BUDGET"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"AF_NO_BUDGET=1"* ]]
+}
+
+@test "af_subscription_type reports the subscription when no API key is in play" {
+  stub_claude_raw unknown '{"subscriptionType":"max"}'
+  run bash -c "$SRC af_subscription_type"
+  [ "$output" = "max" ]
+}
+
+@test "af_subscription_type is empty when an API key is in play" {
+  stub_claude_raw unknown '{"subscriptionType":"max","apiKeySource":"ANTHROPIC_API_KEY"}'
+  run bash -c "$SRC af_subscription_type"
+  [ "$output" = "" ]
+}
+
+# af_subscription_type is best-effort: when claude auth status reports a
+# subscription (no apiKeySource), the confirmation screen should say the
+# worst-case figure above is notional and point at --no-budget.
+@test "confirmation notes a detected Claude subscription and points at --no-budget" {
+  stub_claude_raw unknown '{"subscriptionType":"max"}'
+  run bash -c "$SRC af_confirm 'alpha' 1 </dev/null"
+  [[ "$output" == *"max"* ]]
+  [[ "$output" == *"notional"* ]]
+  [[ "$output" == *"--no-budget"* ]]
+}
+
+# An API key in play (even alongside a claude.ai session) means real API
+# billing, so no subscription note should appear.
+@test "confirmation has no subscription note when an API key is in play" {
+  stub_claude_raw unknown '{"subscriptionType":"max","apiKeySource":"ANTHROPIC_API_KEY"}'
+  run bash -c "$SRC af_confirm 'alpha' 1 </dev/null"
+  [[ "$output" != *"notional"* ]]
+}
+
 @test "declining the confirmation exits 1 and runs nothing" {
   run bash -c "$SRC echo n | af_confirm 'alpha' 1"
   [ "$status" -eq 1 ]

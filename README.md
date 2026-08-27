@@ -187,14 +187,20 @@ recommended.
 | 2 | CI could not be made green (timed out, or exhausted its retries); the PR is left open, labelled `needs-human` |
 | 3 | a safety gate tripped mid-run: `.github/` was touched (G1), the changed-path list behind G1 could not be read at all, the PR has zero required checks (G3), their state could not be read at all (G3 — a `gh` error is not evidence of anything, so it refuses), the merge-time recheck of required checks finds them not passing (G3), the merge itself was refused by GitHub, or `bwrap` is unavailable for a write-mode step and `--no-sandbox` wasn't passed |
 | 4 | an agent returned invalid, incomplete, or non-schema-conforming output — includes the verify/fix id-set mismatch (G2) and `combine` inventing non-canonical ids |
+| 5 | a step hit its `--max-budget-usd` cap. Nothing is malformed — the output just wasn't finished. The message names the step, the cap, the spend, and the `AF_BUDGET_*` variable to raise (see Cost below) |
 
-Codes 2–4 can fire after real spend has already happened (audit and verify
+Codes 2–5 can fire after real spend has already happened (audit and verify
 always run, and cost money, before the first write-mode step); code 1 never
 does — every preflight check runs before anything else, so a code-1 exit is
 always a zero-spend exit. A missing `bwrap` is code 3, not code 1, precisely
 because it's only ever checked at the first write-mode step (`fix`), by which
 point audit, combine, and verify have already spent budget — calling that
 "nothing was spent" would be false.
+
+Code 5 is deliberately distinct from code 4: a cron log reading "exit 4"
+should send someone looking for a schema bug, and a budget cap running out
+is not one — it's an operational limit that needs a bigger number, not a
+fix to agentfixer's output validation.
 
 ## Cost
 
@@ -205,6 +211,38 @@ multiplies that by the number of repos selected and the iteration count and
 shows the total before anything starts — but only in the interactive picker;
 see the `--repo` note above.
 
+**These defaults are sized for small repositories.** A real codebase gives
+its auditors and verifier more to look at, and they will run into the cap
+and exit 5 (see Exit codes above) well before they've finished. Raise the
+cap for the step that's running out, per repo or per run:
+
+```sh
+AF_BUDGET_VERIFY=8 AF_BUDGET_FIX=12 ./agentfixer.sh --repo kypost-server
+```
+
+**On a Claude subscription (Pro/Max), these dollar figures are notional.**
+`--max-budget-usd` caps API spend; a subscription isn't billed per API call,
+so the cap still fires — you'll see exit 5 — but the number it enforces
+against isn't money leaving your account. Raising the specific
+`AF_BUDGET_*` above works, but if you don't want per-step ceilings at all,
+remove them outright with `--no-budget` (or `AF_BUDGET=off`):
+
+```sh
+agentfixer.sh --repo kypost-server --no-budget
+# or
+AF_BUDGET=off ./agentfixer.sh --repo kypost-server
+```
+
+This makes `af_run_agent` omit `--max-budget-usd` entirely rather than
+passing some large number — a large cap still aborts eventually and still
+prints a dollar figure that means nothing on subscription billing. There is
+no reliable way for agentfixer to detect subscription vs. API-key billing
+and switch this on for you automatically (see below), so it stays opt-in:
+the cost of a wrong guess in one direction is "type one extra flag"; in the
+other it's an API-billed run with no spend guard at all. If you're on a
+subscription and pass neither flag nor `AF_BUDGET=off`, the confirmation
+screen will say so and remind you the option exists.
+
 Override the defaults with environment variables:
 
 | variable | default | controls |
@@ -214,6 +252,7 @@ Override the defaults with environment variables:
 | `AF_BUDGET_VERIFY` | 3 | re-verification |
 | `AF_BUDGET_FIX` | 6 | applying fixes |
 | `AF_BUDGET_CIFIX` | 3 | each CI-repair attempt |
+| `AF_BUDGET=off` | unset | disables every per-step cap outright, same as `--no-budget` |
 | `AF_CI_RETRIES` | 3 | max cifix attempts before giving up (exit 2) |
 | `AF_MODEL_AUDIT`, `AF_MODEL_COMBINE`, `AF_MODEL_VERIFY`, `AF_MODEL_FIX`, `AF_MODEL_CIFIX` | opus/sonnet/opus/opus/sonnet | model per step |
 | `AF_CACHE` | `~/.cache/agentfixer` | where worktrees and run logs live |

@@ -12,8 +12,48 @@ readonly AF_EX_CI=2
 readonly AF_EX_GATE=3
 # shellcheck disable=SC2034
 readonly AF_EX_SCHEMA=4
+# shellcheck disable=SC2034
+readonly AF_EX_BUDGET=5
 
 af_die() { printf 'agentfixer: %s\n' "$1" >&2; exit "${2:-$AF_EX_USAGE}"; }
+
+# --no-budget / AF_BUDGET=off disable every per-step cap outright: af_run_agent
+# then omits --max-budget-usd entirely rather than passing some large number.
+# Omitting is the honest form - a huge cap still aborts eventually and still
+# reports a dollar figure, which on Claude subscription billing (as opposed
+# to an API key) is notional: --max-budget-usd enforces regardless of billing
+# mode, but the number it enforces against isn't money being spent.
+AF_NO_BUDGET=0
+[ "${AF_BUDGET:-}" = "off" ] && AF_NO_BUDGET=1
+
+# Best-effort: non-empty only when `claude` reports subscription billing (no
+# API key in play). Never dies on failure - an unreadable or unrecognised
+# result just means the caller stays silent, since this only ever changes
+# wording (confirmation-screen note), never a spend guard's behaviour.
+# Verified against the real `claude auth status --json`: a Claude Max login
+# reports subscriptionType "max"; setting ANTHROPIC_API_KEY makes it report
+# apiKeySource "ANTHROPIC_API_KEY" and subscriptionType null, even with an
+# active claude.ai session underneath - the API key wins for billing purposes.
+af_subscription_type() {
+  claude auth status --json 2>/dev/null | jq -r '
+    if (.apiKeySource // "") != "" then empty else (.subscriptionType // empty) end
+  ' 2>/dev/null
+}
+
+# Maps a step name to the AF_BUDGET_* env var that caps it, so a budget-
+# exhaustion message can tell the user exactly what to raise. audit-sec and
+# audit-hostile share one cap; anything unrecognised (e.g. a test's made-up
+# step name) still gets a sensible AF_BUDGET_<STEP> guess rather than nothing.
+af_budget_var() {
+  case "$1" in
+    audit-sec|audit-hostile) printf 'AF_BUDGET_AUDIT\n' ;;
+    combine)                 printf 'AF_BUDGET_COMBINE\n' ;;
+    verify)                  printf 'AF_BUDGET_VERIFY\n' ;;
+    fix)                     printf 'AF_BUDGET_FIX\n' ;;
+    cifix)                   printf 'AF_BUDGET_CIFIX\n' ;;
+    *) printf 'AF_BUDGET_%s\n' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')" ;;
+  esac
+}
 
 # ------------------------------------------------------- workspace discovery
 # The invoked path's own location defines the workspace: a launcher symlink
@@ -119,7 +159,8 @@ af_render() {
 }
 
 af_render_tty() {
-  local out="" s mark
+  local out="" s mark w
+  w="$(af_width)"
   # Rewind over whatever we drew last time.
   if [ "$AF_LINES" -gt 0 ]; then
     printf '\033[%dA\033[J' "$AF_LINES"
@@ -140,6 +181,11 @@ af_render_tty() {
   done
   out+=" $(printf '─%.0s' $(seq 1 50))"$'\n'
   out+=" spent: \$$(af_total_spend)"$'\n'
+  # Truncate every logical line to the terminal width so logical lines and
+  # physical rows are the same number - otherwise a line longer than the
+  # terminal wraps into extra physical rows the \033[%dA rewind above never
+  # accounts for, leaving stale rows (e.g. old headers) on screen.
+  out="$(printf '%s' "$out" | cut -c "1-$w")"$'\n'
   printf '%s' "$out"
   AF_LINES="$(printf '%s' "$out" | grep -c '')"
 }
@@ -293,8 +339,11 @@ af_run_agent() {
   : "${AF_RUN_DIR:?internal error: agent invoked before af_setup_run}"
   local -a args=(
     --print --output-format json --no-session-persistence
-    --model "$model" --max-budget-usd "$budget" --json-schema "$schema"
+    --model "$model" --json-schema "$schema"
   )
+  if [ "$AF_NO_BUDGET" != "1" ]; then
+    args+=(--max-budget-usd "$budget")
+  fi
   local -a sandbox_pfx=()
   local -a cred_scrub=()
   if [ "$mode" = "rw" ]; then
@@ -335,6 +384,17 @@ af_run_agent() {
       > "$log" 2>>"$log.stderr" <<<"$prompt" || rc=$?
   else
     AF_STEP="$step" claude "${args[@]}" > "$log" 2>>"$log.stderr" <<<"$prompt" || rc=$?
+  fi
+  # Budget exhaustion is not malformed output - it's an operational cap
+  # that needs raising. The envelope's subtype is the reliable signal for
+  # this (verified against the real `claude` binary): stderr only carries a
+  # "Budget limit reached" message when background subagents were actually
+  # running at the moment of the halt, so it is not a discriminator every
+  # budget-exhausted run can be caught by, but the envelope subtype always is.
+  if jq -e '.subtype == "error_max_budget_usd"' "$log" >/dev/null 2>&1; then
+    local spend
+    spend="$(jq -r '.total_cost_usd // "?"' "$log")"
+    af_die "step '$step': budget exhausted - spent \$$spend of the \$$budget cap. Raise it with $(af_budget_var "$step")=<dollars>, or remove all per-step caps with --no-budget (or AF_BUDGET=off) if you're on a Claude subscription, where this dollar figure is notional rather than billed spend." "$AF_EX_BUDGET"
   fi
   if [ "$rc" -ne 0 ]; then
     af_die "step '$step': claude exited $rc (see $log)" "$AF_EX_SCHEMA"
@@ -1157,6 +1217,9 @@ usage: agentfixer.sh [options]
   --dry-run           audit and verify only; change nothing
   --plain             line output instead of a live display
   --no-sandbox        run write-mode agents unsandboxed (not recommended)
+  --no-budget         remove every per-step budget cap (same as AF_BUDGET=off);
+                      on a Claude subscription the caps enforce against a
+                      notional dollar figure, not billed spend
   --yes, -y           skip the confirmation prompt
   --version           print the version and exit
   --help, -h          print this usage and exit
@@ -1192,12 +1255,23 @@ af_worst_case() {
 }
 
 af_confirm() {
-  local repos="$1" iters="$2" count reply
+  local repos="$1" iters="$2" count reply sub
   count="$(printf '%s\n' "$repos" | grep -c '')"
   printf '\n  repos:      %s\n' "$(printf '%s' "$repos" | tr '\n' ' ')"
   printf '  iterations: %s each\n' "$iters"
-  printf '  worst case: $%s (budget caps, not an estimate)\n' \
-    "$(af_worst_case "$count" "$iters")"
+  if [ "$AF_NO_BUDGET" = "1" ]; then
+    printf '  budget:     uncapped (--no-budget / AF_BUDGET=off) - no per-step ceiling.\n'
+    printf '              Steps run to completion regardless of usage; a long run can\n'
+    printf '              still use a lot of it, even though a subscription is not\n'
+    printf '              billed per API call.\n'
+  else
+    printf '  worst case: $%s (budget caps, not an estimate)\n' \
+      "$(af_worst_case "$count" "$iters")"
+    sub="$(af_subscription_type)"
+    if [ -n "$sub" ]; then
+      printf "  note:       authenticated via a Claude '%s' subscription - the figure above is a notional API-rate equivalent, not billed spend. Pass --no-budget to remove per-step caps.\n" "$sub"
+    fi
+  fi
   printf '\n  Agents will open and merge PRs in these repos. Continue? [y/N] '
   read -r reply
   case "$reply" in
@@ -1265,6 +1339,7 @@ af_main() {
       --plain)      AF_PLAIN=1; shift ;;
       --dry-run)    AF_DRY_RUN=1; shift ;;
       --no-sandbox) AF_SANDBOX=0; af_sandbox_warn; shift ;;
+      --no-budget)  AF_NO_BUDGET=1; shift ;;
       --yes|-y)     yes=1; shift ;;
       --version)    printf 'agentfixer %s\n' "$AF_VERSION"; return 0 ;;
       -h|--help)    af_usage; return 0 ;;

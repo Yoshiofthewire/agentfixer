@@ -58,6 +58,33 @@ setup() {
   grep -q -- '--max-budget-usd 3' "$AF_STUB_DIR/claude/probe.args"
 }
 
+# On Claude subscription billing, --max-budget-usd caps a notional dollar
+# figure, not real spend, so it must be possible to drop the cap entirely
+# rather than just raise it. Omitting the flag (not passing some huge number)
+# is the honest form: a huge cap still aborts eventually.
+@test "--no-budget / AF_NO_BUDGET=1 omits --max-budget-usd entirely" {
+  stub_claude probe '{}'
+  bash -c "$SRC AF_NO_BUDGET=1; af_run_agent probe sonnet 3 ro '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' 'hi'"
+  refute_grep -- '--max-budget-usd' "$AF_STUB_DIR/claude/probe.args"
+  grep -q -- '--model sonnet' "$AF_STUB_DIR/claude/probe.args"
+}
+
+@test "AF_BUDGET=off is equivalent to --no-budget" {
+  stub_claude probe '{}'
+  # AF_BUDGET must be set BEFORE sourcing: agentfixer.sh reads it once, at
+  # top level, to derive AF_NO_BUDGET - setting it after $SRC's `source`
+  # would be too late.
+  bash -c "AF_BUDGET=off; source '$AF_SCRIPT'; AF_RUN_DIR='$AF_TMP'
+    af_run_agent probe sonnet 3 ro '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' 'hi'"
+  refute_grep -- '--max-budget-usd' "$AF_STUB_DIR/claude/probe.args"
+}
+
+@test "without --no-budget the cap is still passed (default unchanged)" {
+  stub_claude probe '{}'
+  bash -c "$SRC af_run_agent probe sonnet 3 ro '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' 'hi'"
+  grep -q -- '--max-budget-usd 3' "$AF_STUB_DIR/claude/probe.args"
+}
+
 @test "G4: is_error true exits 4" {
   stub_claude_raw probe '{"is_error":true,"subtype":"error_during_execution","structured_output":null}'
   run bash -c "$SRC af_run_agent probe opus 1 ro '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' 'hi'"
@@ -79,6 +106,46 @@ setup() {
 @test "G4: nonzero exit from claude exits 4" {
   stub_claude probe '{}'
   printf '7' > "$AF_STUB_DIR/claude/probe.exit"
+  run bash -c "$SRC af_run_agent probe opus 1 ro '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' 'hi'"
+  [ "$status" -eq 4 ]
+}
+
+# Budget exhaustion is not a schema failure: the real `claude` binary marks
+# it with subtype "error_max_budget_usd" in the envelope (verified against
+# claude 2.1.246 by actually exhausting a --max-budget-usd cap - see the
+# fix report), and exits 1. That envelope shape, not the exit code and not
+# stderr text, is what agentfixer must key off: stderr carries no message
+# at all unless background subagents were actually running at the moment of
+# the halt, so it is not a reliable discriminator.
+@test "budget exhausted: names the step, the cap, the spend, and the env var to raise" {
+  stub_claude_raw verify '{"is_error":true,"subtype":"error_max_budget_usd","total_cost_usd":3.033536,"structured_output":null}'
+  printf '1' > "$AF_STUB_DIR/claude/verify.exit"
+  run bash -c "$SRC af_run_agent verify opus 3 ro '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' 'hi'"
+  [ "$status" -eq 5 ]
+  [[ "$output" == *"verify"* ]]
+  [[ "$output" == *"3.03"* ]]
+  [[ "$output" == *'$3'* ]]
+  [[ "$output" == *"AF_BUDGET_VERIFY"* ]]
+}
+
+@test "budget exhausted: step names without a dedicated var derive AF_BUDGET_<STEP>" {
+  stub_claude_raw probe '{"is_error":true,"subtype":"error_max_budget_usd","total_cost_usd":1.5,"structured_output":null}'
+  printf '1' > "$AF_STUB_DIR/claude/probe.exit"
+  run bash -c "$SRC af_run_agent probe opus 1 ro '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' 'hi'"
+  [ "$status" -eq 5 ]
+  [[ "$output" == *"AF_BUDGET_PROBE"* ]]
+}
+
+@test "budget exhausted: audit-sec and audit-hostile both name AF_BUDGET_AUDIT" {
+  stub_claude_raw audit-sec '{"is_error":true,"subtype":"error_max_budget_usd","total_cost_usd":3.01,"structured_output":null}'
+  printf '1' > "$AF_STUB_DIR/claude/audit-sec.exit"
+  run bash -c "$SRC af_run_agent audit-sec opus 3 ro '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' 'hi'"
+  [ "$status" -eq 5 ]
+  [[ "$output" == *"AF_BUDGET_AUDIT"* ]]
+}
+
+@test "budget exhausted: a genuine schema failure still exits 4, not 5" {
+  stub_claude_raw probe '{"is_error":true,"subtype":"error_during_execution","structured_output":null}'
   run bash -c "$SRC af_run_agent probe opus 1 ro '{}' '$AF_TMP/o.json' '$AF_TMP/o.log' 'hi'"
   [ "$status" -eq 4 ]
 }
