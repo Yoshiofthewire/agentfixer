@@ -43,6 +43,22 @@ p=$(grep -oE "F-[0-9]{2}-[0-9]+" "$AF_STUB_DIR/claude/fix.args" | tail -1)
 printf "{\"results\":[{\"id\":\"%s\",\"status\":\"fixed\",\"files_changed\":[\"a.ts\"]}]}" "$p" > "$AF_STUB_DIR/claude/fix.json"
 echo patched > a.ts
 '
+
+  # The review stage is part of the default pipeline, so these end-to-end
+  # tests have to answer for it. It approves everything, and answers for
+  # exactly the ids in ITS OWN prompt (the block of review.args after the
+  # last argv line), so a test with two findings is handled too.
+  # tests/review.bats is where the loop itself is exercised.
+  read -r -d '' REVIEW_OK <<'S' || true
+ids=$(awk '/^--print/{b=""} {b = b $0 "\n"} END{printf "%s", b}' \
+      "$AF_STUB_DIR/claude/review.args" \
+      | grep -oE 'F-[0-9]{2}-[0-9]+' | sort -u)
+printf '%s\n' "$ids" \
+  | jq -R -s '{reviews: (split("\n") | map(select(length > 0)
+      | {id: ., approved: true, reason: "ok"}))}' \
+  > "$AF_STUB_DIR/claude/review.json"
+S
+  stub_claude_side_effect review "$REVIEW_OK"
 }
 
 @test "a full green iteration merges and exits 0" {

@@ -49,7 +49,7 @@ af_budget_var() {
     audit-sec|audit-hostile) printf 'AF_BUDGET_AUDIT\n' ;;
     combine)                 printf 'AF_BUDGET_COMBINE\n' ;;
     verify)                  printf 'AF_BUDGET_VERIFY\n' ;;
-    fix)                     printf 'AF_BUDGET_FIX\n' ;;
+    fix|refix)               printf 'AF_BUDGET_FIX\n' ;;
     cifix)                   printf 'AF_BUDGET_CIFIX\n' ;;
     *) printf 'AF_BUDGET_%s\n' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')" ;;
   esac
@@ -115,7 +115,7 @@ AF_REPO_LABEL=""
 AF_ITER_LABEL=""
 AF_BLURB=""
 AF_LINES=0
-AF_STEPS=(audit combine verify fix pr ci merge)
+AF_STEPS=(audit combine verify fix review pr ci merge)
 declare -A AF_STATE=()
 declare -A AF_NOTE=()
 
@@ -478,6 +478,22 @@ read -r -d '' AF_SCHEMA_FIXED <<'SCHEMA' || true
   }}}}}
 SCHEMA
 
+# One verdict per finding id from the fix reviewer. 'objection' is what the
+# next fix agent is handed, so it is required to be actionable rather than
+# merely present - see af_prompt_review.
+# shellcheck disable=SC2034
+read -r -d '' AF_SCHEMA_REVIEW <<'SCHEMA' || true
+{"type":"object","required":["reviews"],"properties":{
+ "reviews":{"type":"array","items":{"type":"object",
+  "required":["id","approved","reason"],
+  "properties":{
+   "id":{"type":"string"},
+   "approved":{"type":"boolean"},
+   "reason":{"type":"string"},
+   "objection":{"type":"string"}
+  }}}}}
+SCHEMA
+
 # ------------------------------------------------------------ run lifecycle
 AF_RUN_DIR="${AF_RUN_DIR:-}"
 AF_WORKTREE="${AF_WORKTREE:-}"
@@ -834,6 +850,207 @@ af_commit_fixes() {
     commit -q -m "$msg"
 }
 
+# --------------------------------------------------------------- fix review
+# Nothing between `fix` and `pr` used to ask the one question that matters:
+# does this diff actually fix the finding it claims to, and does it break
+# anything else? G1 catches .github/ tampering and G2 catches dropped ids;
+# neither reads the code. This does, in a fresh `claude -p` process per round
+# - a reviewer that inherited the fixer's reasoning about its own work would
+# be reviewing the argument rather than the change.
+#
+# Read-only, and so unsandboxed for exactly the reason `verify` is: it only
+# reads. Same model and cap as `verify` too - it is the same job (adversarial
+# judgement over a bounded set of findings), one stage later.
+AF_MODEL_REVIEW="${AF_MODEL_REVIEW:-opus}"
+AF_BUDGET_REVIEW="${AF_BUDGET_REVIEW:-3}"
+# The maximum number of REVIEW calls per iteration. Every review that objects
+# and is not the last permitted one costs one further fix call, so the real
+# ceiling is AF_REVIEW_ROUNDS reviews plus AF_REVIEW_ROUNDS-1 re-fixes.
+# af_worst_case charges for exactly that.
+#
+# 0 disables the stage outright: no reviewer runs, `fix` goes straight to
+# `pr`. The alternative reading - "review once, never loop back" - would make
+# 0 a synonym for 1, and a knob whose 0 means 1 is a knob that lies.
+AF_REVIEW_ROUNDS="${AF_REVIEW_ROUNDS:-3}"
+
+af_prompt_review() {
+  local iter="$1" diff="$2"
+  cat <<PROMPT
+An agent was given the findings below and told to fix them. It produced the
+diff below. You did not make these changes, you did not choose this approach,
+and you must not assume the agent that did was either competent or honest.
+
+The findings it was given:
+$(cat "$iter/confirmed.json")
+
+The complete diff it produced, as committed:
+$diff
+
+Decide, for each finding id separately, whether this diff actually fixes THAT
+finding.
+
+Rules:
+- Read the surrounding code. A diff cannot prove itself correct: a change can
+  look right in isolation and still break a caller that is not shown in it.
+- Set approved=false when the fix is incomplete, treats a symptom rather than
+  the defect, weakens or deletes a test, or introduces a new defect.
+- Set approved=false when nothing in the diff plausibly addresses the finding
+  at all.
+- When approved=false, 'objection' is handed verbatim to the agent that has
+  to act on it. Say what is wrong and what would have to change. "Looks
+  wrong" is not actionable and wastes a round.
+- Approving a bad fix is worse than rejecting a good one: a rejected fix gets
+  another attempt, an approved one gets merged.
+- Return exactly one entry per finding id, no more and no fewer.
+PROMPT
+}
+
+af_step_review() {
+  local iter="$1" round="$2" prompt diff
+  # af_git, never a bare `git -C "$AF_WORKTREE"`: the worktree's .git is a
+  # pointer file the preceding write-mode agent could have repointed, and a
+  # diff read through a gitdir the fixer chose is a diff the fixer wrote.
+  # See af_assert_worktree_git.
+  diff="$(af_git diff "$AF_BASE_SHA..HEAD")" \
+    || af_die "review round $round: could not read the fix diff" "$AF_EX_GATE"
+  prompt="$(af_prompt_review "$iter" "$diff")"
+  ( cd "$AF_WORKTREE" && af_run_agent review "$AF_MODEL_REVIEW" \
+      "$AF_BUDGET_REVIEW" ro "$AF_SCHEMA_REVIEW" \
+      "$iter/review-$round.json" "$iter/review-$round.log" "$prompt" ) \
+    || af_die "review round $round failed" "$?"
+
+  # G2 again: a reviewer that silently drops a finding has approved it by
+  # omission, which is the one thing this stage exists to prevent.
+  af_assert_id_sets "$iter/confirmed.json" '.[].id' \
+                    "$iter/review-$round.json" '.reviews[].id' \
+                    "review round $round"
+}
+
+# Prints one markdown bullet per objection, or nothing at all when every
+# finding was approved. Empty output is the loop's approval signal.
+af_review_objections() {
+  jq -r '[.reviews[] | select(.approved | not)
+          | "- `\(.id)` — \(.objection // .reason)"] | join("\n")' \
+    "$1/review-$2.json"
+}
+
+af_prompt_refix() {
+  local iter="$1" objections="$2"
+  cat <<PROMPT
+An independent reviewer read the fixes already committed in this worktree and
+rejected some of them. Its objections, verbatim:
+
+$objections
+
+The findings those fixes were supposed to address:
+$(cat "$iter/confirmed.json")
+
+Amend the work in place so that none of these objections still hold.
+
+Rules:
+- Address every objection. Arguing with the reviewer in a comment is not a fix.
+- Fix the defect, not the symptom. Do not suppress, silence, or delete a test.
+- Never create or modify anything under .github/. The run aborts if you do.
+- If the repository has a test command, run it and make it pass.
+- Do not commit. The caller commits.
+- Return one result per finding id, including the ones the reviewer did not
+  object to. Do not omit any.
+PROMPT
+}
+
+# A re-fix round writes to its own refix-<round>.json rather than over
+# $iter/fixed.json. fixed.json records which findings the fix stage
+# undertook, and G2 pins its id set to confirmed.json's; a later round can
+# only refine HOW those findings were fixed, never which. Letting a round
+# rewrite it would let one agent's "skipped" retroactively erase a fix that
+# is already committed - and a finding genuinely being abandoned still gets
+# objected to next round, so the cap sends it to a human either way.
+af_step_refix() {
+  local iter="$1" round="$2" objections="$3" prompt
+  prompt="$(af_prompt_refix "$iter" "$objections")"
+  ( cd "$AF_WORKTREE" && af_run_agent refix "$AF_MODEL_FIX" \
+      "$AF_BUDGET_FIX" rw "$AF_SCHEMA_FIXED" \
+      "$iter/refix-$round.json" "$iter/refix-$round.log" "$prompt" ) \
+    || af_die "review round $round: re-fix failed" "$?"
+
+  # G2 then G1 on the amended work, in the same order and by the same
+  # functions as the first fix pass: a re-fix agent can reach for .github/
+  # just as readily as a fix agent, and runs with the same permissions.
+  af_assert_id_sets "$iter/confirmed.json" '.[].id' \
+                    "$iter/refix-$round.json" '.results[].id' \
+                    "refix round $round"
+  af_gate_changed_paths
+  # Same reasoning as af_step_cifix: a round that changed nothing has nothing
+  # to commit, and git's raw "nothing to commit" (exit 1, this project's
+  # usage code) would read as a preflight bug in a cron log.
+  if [ -z "$(af_git status --porcelain)" ]; then
+    af_log warn "review round $round: the re-fix changed nothing"
+    return 0
+  fi
+  af_git add -A
+  af_git \
+    -c user.name="agentfixer" -c user.email="noreply@anthropic.com" \
+    commit -q -m "$(printf 'fix: address review objections (round %s)\n\n%s' \
+      "$round" "$AF_TRAILER")"
+}
+
+# review <-> fix, capped. Every outcome is a FILE under $iter, never a
+# variable: this runs backgrounded under af_with_spinner, whose subshell's
+# assignments the caller never sees. $iter is per-iteration, so none of it
+# survives into the next iteration either.
+#
+#   $iter/review-rounds      review calls made (0 when the stage is disabled)
+#   $iter/objections.md      every round's objections, kept even once resolved
+#   $iter/review-unresolved  exists iff the cap was reached with objections
+#
+# Never dies on an unresolved cap: the caller still has to push, open the PR
+# and label it before halting, and af_die here would take the run down first.
+af_review_loop() {
+  local iter="$1" round=1 objections
+  printf '0\n' > "$iter/review-rounds"
+  [ "$AF_REVIEW_ROUNDS" -ge 1 ] || return 0
+  while :; do
+    af_step_review "$iter" "$round"
+    printf '%s\n' "$round" > "$iter/review-rounds"
+    objections="$(af_review_objections "$iter" "$round")"
+    # The fast path ends here: on a clean round-1 approval this stage has
+    # cost exactly one agent call and written no objection history.
+    [ -n "$objections" ] || return 0
+    printf '**Round %s**\n\n%s\n\n' "$round" "$objections" >> "$iter/objections.md"
+    if [ "$round" -ge "$AF_REVIEW_ROUNDS" ]; then
+      : > "$iter/review-unresolved"
+      return 0
+    fi
+    af_step_refix "$iter" "$round" "$objections"
+    round=$(( round + 1 ))
+  done
+}
+
+# The PR body's review section. Objections are reported even when a later
+# round cleared them - which findings were hard is information a human
+# reviewing the PR wants, for the same reason this tool already lists the
+# findings rejected during verification.
+af_review_section() {
+  local iter="$1" rounds hist=""
+  rounds="$(cat "$iter/review-rounds" 2>/dev/null)" || rounds=""
+  if [ -s "$iter/objections.md" ]; then hist="$(cat "$iter/objections.md")"; fi
+  if [ -z "$rounds" ]; then
+    printf '_No review was recorded for this iteration._\n'
+  elif [ "$rounds" = "0" ]; then
+    printf "_Skipped: \`AF_REVIEW_ROUNDS=0\`._\n"
+  elif [ -f "$iter/review-unresolved" ]; then
+    printf '%s\n\n%s\n' \
+      "**Not approved.** An independent reviewer still objected after $rounds round(s). agentfixer did **not** merge this — it needs a human." \
+      "$hist"
+  elif [ -z "$hist" ]; then
+    printf '_Approved by an independent reviewer on the first round._\n'
+  else
+    printf '%s\n\n%s\n' \
+      "Approved by an independent reviewer in round $rounds. Earlier rounds objected:" \
+      "$hist"
+  fi
+}
+
 # ---------------------------------------------------------------- pull request
 AF_PR_NUM=""
 AF_PR_URL=""
@@ -846,7 +1063,7 @@ af_ensure_labels() {
 }
 
 af_pr_body() {
-  local iter="$1" n="$2" total="$3" fixed rejected
+  local iter="$1" n="$2" total="$3" fixed rejected review
   fixed="$(jq -r -s '
     .[0] as $c | .[1].results as $r
     | [ $r[] | select(.status == "fixed") | .id as $id
@@ -862,6 +1079,8 @@ af_pr_body() {
     | if length == 0 then "_None. Every finding was confirmed._" else join("\n") end
   ' "$iter/findings.json" "$iter/verified.json")"
 
+  review="$(af_review_section "$iter")"
+
   cat <<BODY
 ## agentfixer · iteration $n/$total
 
@@ -874,6 +1093,9 @@ $fixed
 ### Rejected during verification
 $rejected
 
+### Fix review
+$review
+
 ### Provenance
 | step | model |
 |---|---|
@@ -881,6 +1103,7 @@ $rejected
 | combine | $AF_MODEL_COMBINE |
 | verify | $AF_MODEL_VERIFY |
 | fix | $AF_MODEL_FIX |
+| review | $AF_MODEL_REVIEW |
 
 Run log: \`$AF_RUN_DIR\`
 
@@ -1150,7 +1373,13 @@ Refusing to merge." "$AF_EX_GATE" ;;
 AF_DRY_RUN="${AF_DRY_RUN:-0}"
 
 af_run_repo() {
-  local dir="$1" name="$2" iters="$3" base n iter nfind nconf nfixed
+  local dir="$1" name="$2" iters="$3" base n iter nfind nconf nfixed nround
+  # Validated here, before af_preflight, so a typo is a zero-spend exit 1 -
+  # the README promises code 1 always is. Checking it at the review stage
+  # instead would bill a full audit+verify+fix first.
+  case "$AF_REVIEW_ROUNDS" in
+    ''|*[!0-9]*) af_die "AF_REVIEW_ROUNDS must be a non-negative integer (got '$AF_REVIEW_ROUNDS')" "$AF_EX_USAGE" ;;
+  esac
   af_init_display
   AF_REPO_LABEL="$name"
 
@@ -1228,9 +1457,35 @@ af_run_repo() {
     af_status fix "done" "$nfixed fixed"
     AF_BLURB=""
 
+    af_status review active "up to $AF_REVIEW_ROUNDS rounds"
+    af_with_spinner review af_review_loop "$iter"
+    nround="$(cat "$iter/review-rounds")"
+    if [ -f "$iter/review-unresolved" ]; then
+      af_status review failed "objections outstanding after $nround rounds"
+    elif [ "$nround" = "0" ]; then
+      af_status review "done" "skipped"
+    else
+      af_status review "done" "approved in round $nround"
+    fi
+
     af_status pr active ""
     af_step_pr "$iter" "$n" "$iters" "$base"
     af_status pr "done" "#$AF_PR_NUM"
+
+    # The cap was reached with objections outstanding. The work is pushed and
+    # the PR is open with the objections in its body, because a human has to
+    # be able to see what the reviewer refused - but it is not merged, and
+    # the run stops rather than starting another iteration on top of code a
+    # reviewer never cleared. AF_EX_GATE: a review that never approved is a
+    # gate that never opened, same class as G1/G2/G3 and the same operator
+    # response (go look at the needs-human PR).
+    if [ -f "$iter/review-unresolved" ]; then
+      af_require_slug
+      gh pr edit "$AF_PR_NUM" --repo "$AF_SLUG" --add-label needs-human >/dev/null 2>&1 || true
+      af_die "G4: the fix reviewer still objected after $AF_REVIEW_ROUNDS round(s).
+PR #$AF_PR_NUM is open and labelled needs-human; the objections are in its body.
+Refusing to merge work the reviewer never approved, and halting the run." "$AF_EX_GATE"
+    fi
 
     af_status ci active "waiting"
     af_ci_loop "$iter" "$AF_PR_NUM"
@@ -1288,12 +1543,17 @@ af_pick_repos() {
 }
 
 # Worst case per iteration, from the budget caps: both audits, combine,
-# verify, fix, and every permitted cifix retry.
+# verify, fix, every permitted review round, the re-fix each objecting round
+# but the last one costs, and every permitted cifix retry. The review terms
+# are (w reviews + w-1 re-fixes) and vanish at AF_REVIEW_ROUNDS=0; awk's
+# max(w-1,0) keeps the re-fix term from going negative there.
 af_worst_case() {
   awk -v a="$AF_BUDGET_AUDIT" -v c="$AF_BUDGET_COMBINE" -v v="$AF_BUDGET_VERIFY" \
       -v f="$AF_BUDGET_FIX" -v x="$AF_BUDGET_CIFIX" -v r="$AF_CI_RETRIES" \
+      -v w="$AF_REVIEW_ROUNDS" -v q="$AF_BUDGET_REVIEW" \
       -v n="$1" -v i="$2" \
-      'BEGIN { printf "%.2f", n * i * (2*a + c + v + f + r*x) }'
+      'BEGIN { rf = (w > 1 ? w - 1 : 0)
+               printf "%.2f", n * i * (2*a + c + v + f + w*q + rf*f + r*x) }'
 }
 
 af_confirm() {
